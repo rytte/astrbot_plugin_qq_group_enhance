@@ -1,0 +1,34 @@
+{
+  "enabled": {
+    "type": "bool", "description": "启用群聊增强", "default": true
+  },
+  "keywords": {
+    "type": "list", "description": "唤醒关键词", "default": ["小爱"],
+    "hint": "消息正文包含任意关键词即可唤醒，并保留关键词；大小写规则由下方开关控制，空列表仅保留 @ 唤醒。请将这些关键词从 AstrBot 自带唤醒前缀中移除，避免被核心提前删除。"
+  },
+  "keyword_case_sensitive": {
+    "type": "bool", "description": "关键词区分大小写", "default": true,
+    "hint": "关闭后 Airi、airi、AIRI 均可匹配同一关键词。仅影响匹配，发给模型的原文保持不变。"
+  },
+  "traffic_window_minutes": {
+    "type": "int", "description": "流量统计窗口（分钟）", "default": 10,
+    "minimum": 1, "maximum": 1440,
+    "hint": "每分钟移除最早计数、加入刚结束分钟的计数；没有消息的分钟按 0 结算。"
+  },
+  "low_max_messages": {
+    "type": "int", "description": "低流量消息数上限", "default": 15,
+    "minimum": 0, "hint": "不超过此值时，全群共享清醒窗口。"
+  },
+  "medium_max_messages": {
+    "type": "int", "description": "中流量消息数上限", "default": 30,
+    "minimum": 1, "hint": "必须大于低流量上限。中流量按用户清醒；超过此值每次必须关键词或 @。"
+  },
+  "awake_window_seconds": {
+    "type": "float", "description": "清醒窗口（秒）", "default": 180.0,
+    "hint": "正数。关键词或 @机器人 刷新窗口；普通续聊不延长。低流量任何群员可刷新共享窗口，中流量只刷新自己。"
+  },
+  "count_bot_messages": {
+    "type": "bool", "description": "将机器人自身消息计入流量", "default": false,
+    "hint": "仅统计平台实际送达插件的消息。无论是否计数，机器人自身消息均不会由本插件唤醒。"
+  }
+}

@@ -1,0 +1,9 @@
+name: astrbot_plugin_qq_group_enhance
+display_name: QQ 群聊增强
+desc: 按分钟统计群流量，支持保留原文的关键词唤醒、群级和用户级清醒窗口，可配合 QQ 能力增强的消息防抖。
+version: 0.1.0
+author: rytte
+repo: https://github.com/rytte/astrbot_plugin_qq_group_enhance
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.27,<5"
