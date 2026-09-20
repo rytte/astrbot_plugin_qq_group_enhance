@@ -1,91 +1,185 @@
 import asyncio
+import itertools
+from collections import defaultdict
 from copy import copy, deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from astrbot.api.message_components import At, AtAll, Image, Plain, Reply
+from astrbot.api.message_components import At, Plain, Reply
+from astrbot.builtin_stars.astrbot.group_chat_context import GroupChatContext
+from astrbot.core.agent.message import Message
+from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
 from astrbot.core.config.default import DEFAULT_CONFIG
-from astrbot.core.pipeline.process_stage.stage import ProcessStage, StarRequestSubStage
+from astrbot.core.event_bus import EventBus
+from astrbot.core.message.message_event_result import MessageChain, ResultContentType
+from astrbot.core.pipeline.context import call_event_hook
+from astrbot.core.pipeline.preprocess_stage.stage import PreProcessStage
+from astrbot.core.pipeline.process_stage.stage import (
+    AgentRequestSubStage,
+    ProcessStage,
+    StarRequestSubStage,
+)
+from astrbot.core.pipeline.respond.stage import RespondStage
+from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
+from astrbot.core.pipeline.scheduler import PipelineScheduler
 from astrbot.core.pipeline.session_status_check.stage import SessionStatusCheckStage
 from astrbot.core.pipeline.waking_check.stage import WakingCheckStage
 from astrbot.core.pipeline.whitelist_check.stage import WhitelistCheckStage
-from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform.platform_metadata import PlatformMetadata
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+    AiocqhttpMessageEvent,
+)
+from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.session_llm_manager import SessionServiceManager
 from astrbot.core.star.session_plugin_manager import SessionPluginManager
-from astrbot.core.star.star_handler import star_handlers_registry
+from astrbot.core.star.star_handler import EventType, star_handlers_registry
+from astrbot.core.utils.active_event_registry import (
+    ActiveEventRegistry,
+    active_event_registry,
+)
 from astrbot_plugin_qq_group_enhance import main
-from astrbot_plugin_qq_group_enhance.main import GroupWakeFilter, QQGroupEnhancePlugin
-from astrbot_plugin_qq_group_enhance.state import Settings
+from astrbot_plugin_qq_group_enhance.bridge import ACTIVE_RUN, fingerprint
+from astrbot_plugin_qq_group_enhance.main import (
+    RECORD_KEY,
+    GroupWakeFilter,
+    QQGroupEnhancePlugin,
+)
+from astrbot_plugin_qq_group_enhance.reply import REPLY_KEY
+
+IDS = itertools.count(1)
+KEY = ("qq-1", "100")
 
 
-class LocalEvent(AstrMessageEvent):
-    async def send(self, message):
-        self._has_send_oper = True
+class Bot:
+    def __init__(self):
+        self.calls = []
+        self.fail_at = None
+
+    async def call_action(self, action, **params):
+        self.calls.append((action, params))
+        if len(self.calls) == self.fail_at:
+            raise RuntimeError("simulated OneBot failure")
+        return {"message_id": 10000 + len(self.calls)}
+
+    async def send_group_msg(self, **params):
+        return await self.call_action("send_group_msg", **params)
 
 
 def make_event(
     text="普通消息",
-    sender="alice",
-    group="group-1",
+    *,
+    sender="200",
+    group="100",
     platform="qq-1",
     parts=None,
+    mid=None,
     private=False,
     post_type="message",
+    bot=None,
 ):
     message = AstrBotMessage()
     message.type = MessageType.FRIEND_MESSAGE if private else MessageType.GROUP_MESSAGE
-    message.self_id = "bot-1"
+    message.self_id = "300"
     message.group_id = "" if private else group
     message.session_id = sender if private else group
-    message.sender = MessageMember(user_id=sender, nickname=sender)
-    message.message = parts if parts is not None else [Plain(text=text)]
+    message.sender = MessageMember(user_id=sender, nickname=f"用户{sender}")
+    message.message = parts if parts is not None else [Plain(text)]
     message.message_str = text
-    message.message_id = "test-message"
+    message.message_id = str(mid or next(IDS))
     message.raw_message = {"post_type": post_type}
-    return LocalEvent(
+    return AiocqhttpMessageEvent(
         text,
         message,
         PlatformMetadata("aiocqhttp", "test", id=platform),
         message.session_id,
+        bot or Bot(),
     )
+
+
+async def eventually(predicate):
+    async with asyncio.timeout(2):
+        while not predicate():
+            await asyncio.sleep(0.001)
 
 
 @pytest.fixture
-async def harness(monkeypatch):
-    clock = SimpleNamespace(now=0.0)
-    monkeypatch.setattr(
-        main,
-        "time",
-        SimpleNamespace(monotonic=lambda: clock.now, time=lambda: clock.now),
-    )
+async def harness(monkeypatch, request):
+    monkeypatch.setattr(active_event_registry, "_events", defaultdict(set))
+    monkeypatch.setattr(active_event_registry, "_agent_stop_callbacks", {})
     config = deepcopy(DEFAULT_CONFIG)
     config["platform_settings"]["ignore_bot_self_message"] = False
-    plugin_context = SimpleNamespace(
+    config["platform_settings"]["unique_session"] = False
+    config["platform_settings"]["segmented_reply"]["enable"] = False
+    config["provider_ltm_settings"]["group_icl_enable"] = True
+    config["provider_ltm_settings"]["image_caption"] = False
+    config["provider_settings"]["wake_prefix"] = ""
+    queue = asyncio.Queue()
+    context = SimpleNamespace(
         conversation_manager=SimpleNamespace(
-            get_curr_conversation_id=AsyncMock(return_value="conv")
+            get_curr_conversation_id=AsyncMock(return_value="conversation")
+        ),
+        get_config=lambda **kwargs: config,
+        get_event_queue=lambda: queue,
+        get_using_tts_provider_async=AsyncMock(return_value=None),
+    )
+    plugin = QQGroupEnhancePlugin(
+        context,
+        getattr(
+            request,
+            "param",
+            {
+                "keyword_wake": {"keywords": ["小爱"]},
+                "semantic": {"jev_api_key": "test"},
+            },
         ),
     )
-    plugin = QQGroupEnhancePlugin(plugin_context)
+    if plugin.client is not None:
+        plugin.client._send = AsyncMock(
+            side_effect=AssertionError("unmocked Jev request")
+        )
+    clock = SimpleNamespace(now=100.0)
+    if plugin.controller is not None:
+        plugin.controller.clock = lambda: clock.now
     ctx = SimpleNamespace(
         astrbot_config=config,
         astrbot_config_id="test",
         db_helper=None,
-        plugin_manager=SimpleNamespace(context=plugin_context),
+        plugin_manager=SimpleNamespace(context=context),
     )
+    native = GroupChatContext(None, context)
     handlers = []
     for registered in star_handlers_registry.get_handlers_by_module_name(main.__name__):
         handler = copy(registered)
         handler.handler = getattr(plugin, handler.handler_name)
         handlers.append(handler)
+    adapter = next(h for h in handlers if h.handler_name == "observe_message")
+    native_handler = copy(adapter)
+    native_handler.handler_name = "native_record"
+
+    async def native_record(event):
+        await native.handle_message(event)
+
+    native_handler.handler = native_record
+    native_handler.extras_configs = {"priority": 0}
+    handlers.append(native_handler)
+
+    def get_handlers(event_type, **kwargs):
+        selected = handlers
+        names = kwargs.get("plugins_name")
+        if names is not None and "*" not in names and main.PLUGIN_NAME not in names:
+            selected = []
+        return sorted(
+            [h for h in selected if h.event_type == event_type],
+            key=lambda h: -h.extras_configs.get("priority", 0),
+        )
+
     monkeypatch.setattr(
-        star_handlers_registry,
-        "get_handlers_by_event_type",
-        lambda *args, **kwargs: handlers,
+        star_handlers_registry, "get_handlers_by_event_type", get_handlers
     )
     monkeypatch.setattr(
         SessionPluginManager,
@@ -93,251 +187,356 @@ async def harness(monkeypatch):
         AsyncMock(side_effect=lambda event, handlers: handlers),
     )
     monkeypatch.setattr(
+        SessionPluginManager,
+        "is_plugin_enabled_for_session",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
         SessionServiceManager, "is_session_enabled", AsyncMock(return_value=True)
     )
-    waking = WakingCheckStage()
-    await waking.initialize(ctx)
-    waking._umo_auto_name_recorder = MagicMock()
-    whitelist = WhitelistCheckStage()
-    await whitelist.initialize(ctx)
-    session = SessionStatusCheckStage()
-    await session.initialize(ctx)
-    requests = []
+    monkeypatch.setattr(
+        SessionServiceManager,
+        "should_process_llm_request",
+        AsyncMock(return_value=True),
+    )
+    stages = [
+        WakingCheckStage(),
+        WhitelistCheckStage(),
+        SessionStatusCheckStage(),
+        PreProcessStage(),
+    ]
+    for stage in stages:
+        await stage.initialize(ctx)
+    stages[0]._umo_auto_name_recorder = MagicMock()
+    respond = RespondStage()
+    await respond.initialize(ctx)
+    decorate = ResultDecorateStage()
+    await decorate.initialize(ctx)
+    fixture = SimpleNamespace(
+        plugin=plugin,
+        config=config,
+        context=context,
+        queue=queue,
+        clock=clock,
+        native=native,
+        handlers=handlers,
+        adapter=adapter,
+        waking=stages[0],
+        whitelist=stages[1],
+        respond=respond,
+        decorate=decorate,
+        requests=[],
+        payloads=[],
+        before_submit=None,
+        auto_send=False,
+        bot=Bot(),
+    )
+
+    async def chat(**payload):
+        fixture.payloads.append(payload)
+        return LLMResponse(role="assistant", completion_text="模型回复")
+
+    async def chat_stream(**payload):
+        yield await chat(**payload)
+
+    provider = SimpleNamespace(
+        text_chat=chat, text_chat_stream=chat_stream, provider_config={}
+    )
+    fixture.provider = provider
 
     async def request(event):
-        requests.append(event)
+        fixture.requests.append(event)
+        req = ProviderRequest(
+            prompt=event.message_str, session_id=event.unified_msg_origin
+        )
+        await native.on_req_llm(event, req)
+        if await call_event_hook(event, EventType.OnLLMRequestEvent, req):
+            return
+        runner = object.__new__(ToolLoopAgentRunner)
+        runner.provider = provider
+        runner.req = req
+        runner.run_context = SimpleNamespace(
+            context=SimpleNamespace(event=event),
+            messages=[Message.model_validate(await req.assemble_context())],
+        )
+        runner._abort_signal = asyncio.Event()
+        runner.request_max_retries = 0
+        runner.streaming = False
+        await call_event_hook(event, EventType.OnAgentBeginEvent, runner.run_context)
+        if fixture.before_submit:
+            await fixture.before_submit(event, runner)
+        async for response in runner._iter_llm_responses():
+            await call_event_hook(event, EventType.OnLLMResponseEvent, response)
+            if fixture.auto_send:
+                result = event.plain_result(response.completion_text)
+                result.result_content_type = ResultContentType.LLM_RESULT
+                event.set_result(result)
         yield
 
     process = ProcessStage()
     process.ctx = ctx
-    process.agent_sub_stage = SimpleNamespace(process=request)
+    process.agent_sub_stage = AgentRequestSubStage()
+    await process.agent_sub_stage.initialize(ctx)
+    process.agent_sub_stage.process = request
     process.star_request_sub_stage = StarRequestSubStage()
     await process.star_request_sub_stage.initialize(ctx)
 
     async def run(event):
-        await waking.process(event)
-        for stage in (whitelist, session):
-            if not event.is_stopped():
-                await stage.process(event)
-        if not event.is_stopped():
-            async for _ in process.process(event):
-                pass
+        event.bot = fixture.bot
+        await asyncio.create_task(scheduler.execute(event))
         return event
 
-    fixture = SimpleNamespace(
-        plugin=plugin,
-        clock=clock,
-        config=config,
-        handlers=handlers,
-        waking=waking,
-        whitelist=whitelist,
-        requests=requests,
-        run=run,
-    )
-    yield fixture
-    await plugin.terminate()
+    scheduler = object.__new__(PipelineScheduler)
+    scheduler.stages = [*stages, process, decorate, respond]
+    scheduler.ctx = ctx
+    fixture.scheduler = scheduler
+    fixture.process = process
+    fixture.run = run
+    fixture.request = request
+
+    async def settle():
+        await asyncio.gather(*plugin.replies.tasks, return_exceptions=True)
+        await eventually(lambda: not plugin.replies.tasks)
+
+    fixture.settle = settle
+    await plugin.initialize()
+    try:
+        yield fixture
+    finally:
+        await plugin.terminate()
 
 
-async def test_keyword_in_middle_keeps_full_text_and_reaches_default_llm(harness):
-    event = make_event("有人知道小爱今天在不在吗？")
-    original_parts = list(event.get_messages())
-    await harness.run(event)
-    assert harness.requests == [event]
-    assert event.message_str == "有人知道小爱今天在不在吗？"
-    assert event.message_obj.message_str == event.message_str
-    assert event.get_messages() == original_parts
-    assert harness.plugin.controller.groups[("qq-1", "group-1")].shared_until == 180
-
-
-@pytest.mark.parametrize("case_sensitive", [True, False])
-@pytest.mark.parametrize(
-    "keyword,text,sensitive_match,insensitive_match",
-    [
-        ("Airi", "你好 Airi", True, True),
-        ("Airi", "你好 airi", False, True),
-        ("airi", "你好 AIRI", False, True),
-        ("AIRI", "你好 AiRi", False, True),
-        ("Straße", "你好 STRASSE", False, True),
-        ("小爱", "小爱，你好", True, True),
-        ("Airi", "你好 Airo", False, False),
-    ],
-)
-async def test_keyword_case_switch_preserves_original_input(
-    harness, case_sensitive, keyword, text, sensitive_match, insensitive_match
-):
-    settings = Settings.from_mapping(
-        {"keywords": [keyword], "keyword_case_sensitive": case_sensitive}
-    )
-    harness.plugin.settings = settings
-    harness.plugin.controller.settings = settings
-    event = make_event(text)
-    await harness.run(event)
-    expected = sensitive_match if case_sensitive else insensitive_match
-    assert harness.requests == ([event] if expected else [])
-    assert event.message_str == text
-    assert event.message_obj.message_str == text
-    assert event.get_messages()[0].text == text
-    assert harness.plugin.settings.keywords == (keyword,)
-
-
-async def test_low_shared_window_refresh_and_expiry(harness):
-    await harness.run(make_event("小爱你好"))
-    harness.clock.now = 100
-    await harness.run(make_event("小爱", sender="bob"))
-    harness.clock.now = 279
-    await harness.run(make_event(sender="carol"))
-    assert len(harness.requests) == 3
-    harness.clock.now = 280
-    await harness.run(make_event(sender="carol"))
-    assert len(harness.requests) == 3
-
-
-async def test_non_waking_messages_are_counted_and_transition_on_minute(harness):
-    for _ in range(16):
-        await harness.run(make_event())
-    assert not harness.requests
-    group = harness.plugin.controller.groups[("qq-1", "group-1")]
-    assert group.current_count == 16
-    assert group.level == "low"
-    harness.clock.now = 60
-    await harness.run(make_event("小爱"))
-    assert group.level == "medium"
-    await harness.run(make_event(sender="bob"))
-    await harness.run(make_event(sender="alice"))
-    assert [event.get_sender_id() for event in harness.requests] == ["alice", "alice"]
-
-
-async def test_unique_session_does_not_split_group_traffic_or_shared_window(harness):
-    harness.waking.unique_session = True
-    await harness.run(make_event("小爱"))
-    await harness.run(make_event(sender="bob"))
-    assert len(harness.requests) == 2
-    assert (
-        harness.requests[0].unified_msg_origin != harness.requests[1].unified_msg_origin
-    )
-    assert len(harness.plugin.controller.groups) == 1
-    await harness.run(make_event(group="group-2"))
-    await harness.run(make_event(platform="qq-2"))
-    assert len(harness.requests) == 2
-
-
-async def test_high_requires_explicit_keyword_or_actual_bot_mention(harness):
-    for _ in range(31):
-        await harness.run(make_event())
-    harness.clock.now = 60
-    await harness.run(make_event("小爱"))
-    await harness.run(make_event())
-    await harness.run(make_event("你好", parts=[At(qq="bot-1"), Plain("你好")]))
-    await harness.run(make_event())
-    assert len(harness.requests) == 2
-    group = harness.plugin.controller.groups[("qq-1", "group-1")]
-    assert group.level == "high"
-    assert not group.users
-    assert group.shared_until == 0
+@pytest.fixture
+def awake_group(harness):
+    """Reply/coverage tests start with an active conversation."""
+    harness.plugin.controller.awakened(KEY)
 
 
 @pytest.mark.parametrize(
     "parts",
     [
-        [AtAll(), Plain("你好")],
-        [Reply(id="quote", sender_id="bot-1", chain=[Plain("小爱")]), Plain("你好")],
-        [At(qq="someone-else", name="小爱"), Plain("你好")],
+        None,
+        [At(qq="300"), Plain("你好")],
+        [Reply(id="42", sender_id="300", chain=[Plain("旧消息")]), Plain("你好")],
     ],
 )
-async def test_quotes_and_other_mentions_do_not_implicitly_wake(harness, parts):
-    event = make_event("你好", parts=parts)
+async def test_explicit_wake_preserves_text_and_never_calls_jev(harness, parts):
+    event = make_event("你好小爱", parts=parts)
     await harness.run(event)
-    assert not harness.requests
-    assert not event.is_at_or_wake_command
-
-
-async def test_bot_mention_opens_window_even_without_text(harness):
-    await harness.run(make_event("", parts=[At(qq="bot-1")]))
-    await harness.run(make_event(sender="bob"))
-    assert len(harness.requests) == 2
-
-
-async def test_image_can_continue_an_awake_conversation(harness):
-    await harness.run(make_event("小爱"))
-    image = make_event("", sender="bob", parts=[Image(file="test.png")])
-    await harness.run(image)
-    assert harness.requests[-1] is image
-
-
-async def test_self_messages_neither_count_nor_wake_by_default(harness):
-    event = make_event("小爱", sender="bot-1")
-    await harness.run(event)
-    assert not harness.requests
-    assert not harness.plugin.controller.groups
-
-
-async def test_self_count_option_never_enables_self_replies(harness):
-    from astrbot_plugin_qq_group_enhance.state import Settings, TrafficController
-
-    harness.plugin.settings = Settings(count_bot_messages=True)
-    harness.plugin.controller = TrafficController(harness.plugin.settings)
-    event = make_event("/小爱", sender="bot-1", post_type="message_sent")
-    await harness.run(event)
-    assert not harness.requests
-    assert not event.is_at_or_wake_command
-    assert harness.plugin.controller.groups[("qq-1", "group-1")].current_count == 1
+    assert harness.requests == [event]
+    assert event.message_str == "你好小爱"
+    assert harness.plugin.controller.groups[KEY].awake_until == 280
+    assert event.get_extra(RECORD_KEY).status == "covered"
+    harness.plugin.client._send.assert_not_called()
 
 
 @pytest.mark.parametrize(
-    "kwargs", [{"private": True}, {"post_type": "notice"}, {"post_type": "request"}]
+    "harness,text,expected",
+    [
+        (
+            {"keyword_wake": {"keywords": ["Airi"], "keyword_ignore_case": False}},
+            "你好 airi",
+            False,
+        ),
+        (
+            {"keyword_wake": {"keywords": ["Airi"], "keyword_ignore_case": True}},
+            "你好 airi",
+            True,
+        ),
+        ({"keyword_wake": {"keywords": ["Airi"]}}, "你好 AIRI", True),
+        (
+            {"keyword_wake": {"keywords": ["Airi"], "keyword_ignore_case": False}},
+            "你好 Airi",
+            True,
+        ),
+        (
+            {"keyword_wake": {"keywords": [], "keyword_ignore_case": True}},
+            "你好 airi",
+            False,
+        ),
+    ],
+    indirect=["harness"],
 )
-async def test_private_and_non_message_events_are_not_managed(harness, kwargs):
-    event = make_event("小爱", **kwargs)
+async def test_keyword_group_controls_matching_without_a_switch(
+    harness, text, expected
+):
+    event = make_event(text)
     await harness.run(event)
+    assert event.message_str == text
+    assert harness.requests == ([event] if expected else [])
+    for event in (
+        make_event("你好", parts=[At(qq="300"), Plain("你好")]),
+        make_event("追问", parts=[Reply(id="42", sender_id="300"), Plain("追问")]),
+    ):
+        await harness.run(event)
+        assert harness.requests[-1] is event
+    assert len(harness.requests) == int(expected) + 2
+    harness.plugin.client._send.assert_not_called()
+
+
+async def test_observer_and_awake_group_do_not_automatically_wake(harness):
+    await harness.run(make_event())
+    group = harness.plugin.controller.groups[KEY]
+    assert group.awake_until == 0
+    assert group.deadline is None
+    assert group.worker is None
+    assert not group.pending
+    await harness.run(make_event("小爱"))
+    harness.clock.now = 110
+    await harness.run(make_event("仍然需要语义判断"))
+    assert len(harness.requests) == 1
+    assert group.awake_until == 280
+    assert group.deadline == 115
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_semantic_wake_injects_arrivals_and_cleans_only_actual_input(harness):
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def judge(key, history, candidates, valid):
+        entered.set()
+        await finish.wait()
+        return {m["message_id"]: 0.99 for m in candidates}
+
+    harness.plugin.controller.judge = judge
+    events = [make_event(f"消息{i}", mid=i) for i in range(1, 9)]
+    for event in events[:3]:
+        await harness.run(event)
+    group = harness.plugin.controller.groups[KEY]
+    harness.clock.now = 110
+    group.changed.set()
+    await entered.wait()
+    for event in events[3:5]:
+        await harness.run(event)
+    finish.set()
+    await eventually(lambda: len(harness.requests) == 1)
+    await harness.settle()
+    replay = harness.requests[0]
+    assert replay.get_extra(REPLY_KEY)
+    assert replay.message_obj.message_id == "5"
+    assert harness.queue.empty()
+    assert len(harness.requests) == 1
+    assert all(events[i].get_extra(RECORD_KEY).status == "covered" for i in range(5))
+    assert not group.pending
+    assert not harness.native.raw_records[replay.unified_msg_origin]
+    for event in events[5:]:
+        await harness.run(event)
+    # Simulate a later debounced input including only 6/7: preparation is not coverage.
+    text = "\n".join(e.get_extra(RECORD_KEY).native_text for e in events[5:7])
+    payload = {"contexts": [{"role": "user", "content": text}]}
+    assert set(group.pending) == {"6", "7", "8"}
+    token = ACTIVE_RUN.set((harness.plugin.observer, replay))
+    try:
+        await harness.provider.text_chat(**payload)
+    finally:
+        ACTIVE_RUN.reset(token)
+    assert set(group.pending) == {"8"}
+    assert events[5].get_extra(RECORD_KEY).status == "covered"
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_trimmed_input_is_not_marked_covered(harness):
+    old = make_event("未被模型实际看到")
+    await harness.run(old)
+
+    async def trim(event, runner):
+        assert old.get_extra(RECORD_KEY).status == "pending"
+        runner.run_context.messages = [Message(role="user", content="只有裁剪后的摘要")]
+
+    harness.before_submit = trim
+    await harness.run(make_event("小爱"))
+    assert old.get_extra(RECORD_KEY).status == "pending"
+
+
+@pytest.mark.parametrize("gate", ["whitelist", "session", "plugin", "profile"])
+async def test_admission_checks_run_before_caching(harness, monkeypatch, gate):
+    if gate == "whitelist":
+        harness.whitelist.enable_whitelist_check = True
+        harness.whitelist.whitelist = ["999"]
+    elif gate == "session":
+        monkeypatch.setattr(
+            SessionServiceManager, "is_session_enabled", AsyncMock(return_value=False)
+        )
+    elif gate == "plugin":
+        monkeypatch.setattr(
+            SessionPluginManager,
+            "filter_handlers_by_session",
+            AsyncMock(return_value=[]),
+        )
+    else:
+        harness.config["plugin_set"] = []
+    await harness.run(make_event("小爱"))
     assert not harness.plugin.controller.groups
-    assert event.get_extra(main.DECISION_KEY) is None
 
 
-async def test_filter_is_idempotent_without_promoting_rejected_event(harness):
+@pytest.mark.parametrize("change", ["reset", "conversation", "disabled", "covered"])
+@pytest.mark.usefixtures("awake_group")
+async def test_queued_wake_cannot_survive_invalidated_state(
+    harness, monkeypatch, change
+):
+    event = make_event("你觉得呢")
+    await harness.run(event)
+    group = harness.plugin.controller.groups[KEY]
+    record = event.get_extra(RECORD_KEY)
+    assert await harness.plugin._semantic_wake(KEY, group, [record])
+    replay = next(iter(harness.plugin.replies.tasks.values())).event
+    if change == "reset":
+        ActiveEventRegistry().stop_all(event.unified_msg_origin)
+    elif change == "conversation":
+        harness.context.conversation_manager.get_curr_conversation_id.return_value = (
+            "new"
+        )
+    elif change == "disabled":
+        monkeypatch.setattr(
+            SessionPluginManager,
+            "is_plugin_enabled_for_session",
+            AsyncMock(return_value=False),
+        )
+    else:
+        harness.plugin.controller.covered(KEY, {record.id})
+    await harness.settle()
+    assert not harness.requests
+    assert replay.is_stopped()
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_reset_during_awaited_wake_eligibility(harness, monkeypatch):
     event = make_event()
-    wake_filter = GroupWakeFilter()
-    assert wake_filter.filter(event, harness.config) is False
-    assert wake_filter.filter(event, harness.config) is False
-    assert harness.plugin.controller.groups[("qq-1", "group-1")].current_count == 1
+    await harness.run(event)
+    record = event.get_extra(RECORD_KEY)
+    group = harness.plugin.controller.groups[KEY]
+
+    async def reset(*args):
+        harness.plugin.controller.reset(KEY)
+        return True
+
+    monkeypatch.setattr(harness.plugin, "_session_eligible", reset)
+    assert not await harness.plugin._semantic_wake(KEY, group, [record])
+    assert harness.queue.empty()
 
 
-async def test_whitelist_blocks_llm_and_window_creation(harness):
-    harness.whitelist.enable_whitelist_check = True
-    harness.whitelist.whitelist = ["group-2"]
-    await harness.run(make_event("小爱"))
-    assert not harness.requests
-    group = harness.plugin.controller.groups[("qq-1", "group-1")]
-    assert not group.shared_until
-    assert not group.users
+async def test_shared_awake_state_across_isolated_sessions(harness):
+    harness.waking.unique_session = True
+    first, second = make_event("小爱"), make_event("群员互聊", sender="201")
+    await harness.run(first)
+    await harness.run(second)
+    assert first.unified_msg_origin != second.unified_msg_origin
+    assert len(harness.plugin.controller.groups) == 1
+    assert harness.plugin.controller.groups[KEY].awake_until == 280
+    assert len(harness.requests) == 1
 
 
-async def test_disabled_session_does_not_create_wake_window(harness, monkeypatch):
-    monkeypatch.setattr(
-        SessionServiceManager, "is_session_enabled", AsyncMock(return_value=False)
-    )
-    await harness.run(make_event("小爱"))
-    assert not harness.requests
-    assert not harness.plugin.controller.groups[("qq-1", "group-1")].shared_until
+async def test_command_is_executed_once_and_never_a_candidate(harness):
+    calls = []
 
-
-async def test_session_plugin_disable_prevents_wake_side_effects(harness, monkeypatch):
-    monkeypatch.setattr(
-        SessionPluginManager, "filter_handlers_by_session", AsyncMock(return_value=[])
-    )
-    await harness.run(make_event("小爱"))
-    assert not harness.requests
-    assert not harness.plugin.controller.groups[("qq-1", "group-1")].shared_until
-
-
-async def test_recognized_commands_still_execute_without_opening_window(harness):
-    command_calls = []
-
-    async def command_handler(event):
-        command_calls.append(event.message_str)
+    async def command(event):
+        calls.append(event.message_str)
         await event.send(event.plain_result("指令完成"))
 
-    handler = copy(harness.handlers[0])
-    handler.handler = command_handler
+    handler = copy(harness.adapter)
+    handler.handler_name = "command"
+    handler.handler = command
+    handler.extras_configs = {"priority": 1}
     handler.event_filters = [
         CommandFilter(
             "help", handler_md=SimpleNamespace(handler=lambda self, event: None)
@@ -345,53 +544,143 @@ async def test_recognized_commands_still_execute_without_opening_window(harness)
     ]
     harness.handlers.append(handler)
     await harness.run(make_event("/help"))
-    assert command_calls == ["help"]
+    assert calls == ["help"]
     assert not harness.requests
-    assert not harness.plugin.controller.groups[("qq-1", "group-1")].shared_until
+    assert not harness.plugin.controller.groups[KEY].pending
 
 
-async def test_plugin_disable_and_terminate_restore_core_behavior(harness):
-    from astrbot_plugin_qq_group_enhance.state import Settings
+async def test_send_success_renews_but_rewake_and_model_response_do_not(harness):
+    await harness.run(make_event("小爱"))
+    group = harness.plugin.controller.groups[KEY]
+    harness.clock.now = 110
+    event = make_event("小爱，再问一次")
+    await harness.run(event)
+    assert group.awake_until == 280
+    harness.clock.now = 120
+    result = event.plain_result("实际发送")
+    result.result_content_type = ResultContentType.LLM_RESULT
+    event.set_result(result)
+    await harness.respond.process(event)
+    assert group.awake_until == 300
+    assert any(m.bot and m.text == "实际发送" for m in group.history.values())
+    # Duplicate respond notifications for this response cannot renew again.
+    harness.clock.now = 130
+    event.set_result(result)
+    await harness.respond.process(event)
+    assert group.awake_until == 300
 
-    harness.plugin.settings = Settings(enabled=False)
-    await harness.run(make_event("/你好"))
-    assert len(harness.requests) == 1
-    assert not harness.plugin.controller.groups
+
+@pytest.mark.parametrize("fail_at", [1, 2])
+async def test_partial_or_failed_segmented_reply_does_not_renew(harness, fail_at):
+    event = make_event("小爱")
+    await harness.run(event)
+    harness.respond.enable_seg = True
+    harness.respond.interval_method = "random"
+    harness.respond.interval = [0, 0]
+    harness.bot.fail_at = fail_at
+    harness.clock.now = 120
+    result = event.chain_result([Plain("第一段"), Plain("第二段")])
+    result.result_content_type = ResultContentType.LLM_RESULT
+    event.set_result(result)
+    await harness.respond.process(event)
+    assert len(harness.bot.calls) == 2
+    assert harness.plugin.controller.groups[KEY].awake_until == 280
+
+
+@pytest.mark.parametrize("fail", [False, True])
+async def test_streaming_completion_renews_only_after_delivery(harness, fail):
+    event = make_event("小爱")
+    await harness.run(event)
+
+    async def stream():
+        yield MessageChain([Plain("第一段")])
+        assert harness.plugin.controller.groups[KEY].awake_until == 280
+        yield MessageChain([Plain("第二段")])
+
+    harness.config["provider_settings"]["unsupported_streaming_strategy"] = "collect"
+    if fail:
+        harness.bot.fail_at = 1
+    harness.clock.now = 120
+    result = event.plain_result("")
+    result.result_content_type = ResultContentType.STREAMING_RESULT
+    result.async_stream = stream()
+    event.set_result(result)
+    if fail:
+        with pytest.raises(RuntimeError, match="OneBot"):
+            await harness.respond.process(event)
+    else:
+        await harness.respond.process(event)
+    assert harness.plugin.controller.groups[KEY].awake_until == (280 if fail else 300)
+
+
+async def test_tool_delivery_is_history_but_does_not_renew(harness):
+    event = make_event("小爱")
+    await harness.run(event)
+    harness.clock.now = 120
+    await event.send(event.plain_result("工具内部消息"))
+    assert harness.plugin.controller.groups[KEY].awake_until == 280
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_provider_failure_does_not_restore_covered_candidates(harness):
+    pending = make_event("未直接唤醒")
+    await harness.run(pending)
+
+    async def fail(**kwargs):
+        raise RuntimeError("provider failure")
+
+    harness.provider.text_chat = fail
+    with pytest.raises(RuntimeError, match="provider failure"):
+        await harness.run(make_event("小爱"))
+    assert pending.get_extra(RECORD_KEY).status == "covered"
+    assert not harness.plugin.controller.groups[KEY].pending
+
+
+async def test_observer_failure_preserves_provider_result_and_send(
+    harness, monkeypatch
+):
+    monkeypatch.setattr(
+        harness.plugin.observer,
+        "_submitted",
+        MagicMock(side_effect=RuntimeError("observer")),
+    )
+    harness.auto_send = True
+    await harness.run(make_event("小爱"))
+    assert len(harness.payloads) == 1
+    assert len(harness.bot.calls) == 1
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_ambiguous_equal_fingerprints_do_not_clear_unrelated_inputs(harness):
+    a, b = make_event("相同文本"), make_event("相同文本")
+    await harness.run(a)
+    await harness.run(b)
+    for event in (a, b):
+        record = event.get_extra(RECORD_KEY)
+        record.input_fingerprints.add(fingerprint("相同文本"))
+    token = ACTIVE_RUN.set((harness.plugin.observer, a))
+    try:
+        harness.plugin.observer._submitted(
+            {"contexts": [{"role": "user", "content": "相同文本"}]}
+        )
+    finally:
+        ACTIVE_RUN.reset(token)
+    assert all(e.get_extra(RECORD_KEY).status == "pending" for e in (a, b))
+
+
+async def test_unload_restores_hooks_and_provider_methods(harness):
+    await harness.run(make_event("小爱"))
+    assert "text_chat" in vars(harness.provider)
+    patches = list(harness.plugin.observer.patches)
     await harness.plugin.terminate()
     assert GroupWakeFilter.plugin is None
+    for target, name, existed, raw, _ in patches:
+        assert (name in vars(target)) == existed
+        if existed:
+            assert vars(target)[name] is raw
 
 
-async def test_minute_task_rolls_silent_group_and_stops_on_unload(harness, monkeypatch):
-    await harness.run(make_event("小爱"))
-    calls = []
-    entered = asyncio.Event()
-
-    async def sleep(delay):
-        calls.append(delay)
-        entered.set()
-        await asyncio.Future()
-
-    monkeypatch.setattr(
-        main,
-        "asyncio",
-        SimpleNamespace(
-            create_task=asyncio.create_task,
-            sleep=sleep,
-            CancelledError=asyncio.CancelledError,
-        ),
-    )
-    harness.clock.now = 60
-    await harness.plugin.initialize()
-    await entered.wait()
-    assert calls == [60]
-    assert sum(harness.plugin.controller.groups[("qq-1", "group-1")].buckets) == 1
-    task = harness.plugin.timer
-    await harness.plugin.terminate()
-    assert task.cancelled()
-    assert not harness.plugin.controller.groups
-
-
-async def test_actual_qq_debouncer_accepts_new_wake_flag(harness):
+async def test_real_qq_debouncer_accepts_explicit_but_not_semantic_wakes(harness):
     from astrbot_plugin_qq_enhance.debounce import (
         ARRIVAL_KEY,
         ArrivalFilter,
@@ -405,6 +694,7 @@ async def test_actual_qq_debouncer_accepts_new_wake_flag(harness):
                 "enabled": True,
                 "shared_group": True,
                 "initial_window_seconds": 0,
+                "followup_window_seconds": 0,
                 "max_wait_seconds": 5,
                 "ignore_prefixes": ["/", "!"],
             },
@@ -414,17 +704,971 @@ async def test_actual_qq_debouncer_accepts_new_wake_flag(harness):
         ),
     )
     debouncer = MessageDebouncer(qq)
+    batches = []
+
+    async def capture(event):
+        await debouncer.capture(event)
+        batches.append(event.get_extra(ARRIVAL_KEY).batch)
+
+    handler = copy(harness.adapter)
+    handler.handler_name = "qq_debounce"
+    handler.handler = capture
+    handler.event_filters = [ArrivalFilter()]
+    handler.extras_configs = {"priority": -20000}
+    harness.handlers.append(handler)
+    try:
+        explicit = make_event("小爱，你好")
+        await harness.run(explicit)
+        assert batches[-1] == [explicit.get_extra(ARRIVAL_KEY)]
+        ordinary = make_event("你再解释下")
+        await harness.run(ordinary)
+        assert batches[-1] == []
+        assert len(harness.requests) == 1
+        record = ordinary.get_extra(RECORD_KEY)
+        group = harness.plugin.controller.groups[KEY]
+        assert await harness.plugin._semantic_wake(KEY, group, [record])
+        await harness.settle()
+        assert len(batches) == 2
+        assert harness.requests[-1].get_extra(ARRIVAL_KEY) is None
+        assert len(harness.requests) == 2
+        assert record.status == "covered"
+    finally:
+        await debouncer.close()
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    ["remote", "no_injection", "disabled", "session_disabled", "whitelist"],
+)
+@pytest.mark.usefixtures("awake_group")
+async def test_semantic_prerequisites_checked_before_network(
+    harness, monkeypatch, unsupported
+):
+    event = make_event()
+    await harness.run(event)
+    if unsupported == "remote":
+        harness.process.agent_sub_stage.agent_sub_stage = object()
+    elif unsupported == "no_injection":
+        harness.config["provider_ltm_settings"]["group_icl_enable"] = False
+    elif unsupported == "session_disabled":
+        monkeypatch.setattr(
+            SessionServiceManager, "is_session_enabled", AsyncMock(return_value=False)
+        )
+    elif unsupported == "whitelist":
+        harness.config["platform_settings"]["enable_id_white_list"] = True
+        harness.config["platform_settings"]["id_whitelist"] = ["999"]
+    else:
+        monkeypatch.setattr(
+            SessionPluginManager,
+            "is_plugin_enabled_for_session",
+            AsyncMock(return_value=False),
+        )
+    group = harness.plugin.controller.groups[KEY]
+    harness.clock.now = 110
+    group.changed.set()
+    await eventually(lambda: group.worker is None)
+    harness.plugin.client._send.assert_not_called()
+    assert not harness.requests
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_queued_identity_survives_history_eviction_and_is_released(harness):
+    from astrbot_plugin_qq_group_enhance.state import ChatMessage
+
+    event = make_event("这是对你的追问")
+    await harness.run(event)
+    record = event.get_extra(RECORD_KEY)
+    group = harness.plugin.controller.groups[KEY]
+    assert await harness.plugin._semantic_wake(KEY, group, [record])
+    for i in range(40):
+        harness.plugin.controller.add(
+            KEY,
+            ChatMessage(f"bot-{i}", "300", "机器人", "背景消息", 0, bot=True),
+            False,
+        )
+    assert record.id not in group.history
+    assert group.reserved[record.id] is record
+    # A normal request can still invalidate this queued wake after history rolls.
+    harness.plugin.controller.covered(KEY, {record.id})
+    await harness.settle()
+    assert not harness.requests
+    assert not group.reserved
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_rejected_reply_releases_reserved_tracking(harness):
+    event = make_event()
+    await harness.run(event)
+    group = harness.plugin.controller.groups[KEY]
+    assert await harness.plugin._semantic_wake(
+        KEY, group, [event.get_extra(RECORD_KEY)]
+    )
+    assert group.reserved
+    harness.config["platform_settings"]["enable_id_white_list"] = True
+    harness.config["platform_settings"]["id_whitelist"] = ["999"]
+    await harness.settle()
+    assert not group.reserved
+    assert not harness.requests
+
+
+async def test_stream_tool_messages_alone_cannot_prove_reply_delivery(harness):
+    event = make_event("小爱")
+    await harness.run(event)
+    harness.clock.now = 120
+
+    async def stream():
+        await event.send(MessageChain([Plain("工具输出")], type="tool_direct_result"))
+        if False:
+            yield
+
+    result = event.plain_result("")
+    result.result_content_type = ResultContentType.STREAMING_RESULT
+    result.async_stream = stream()
+    event.set_result(result)
+    await harness.respond.process(event)
+    assert len(harness.bot.calls) == 1
+    assert harness.plugin.controller.groups[KEY].awake_until == 280
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_other_plugin_stop_cannot_be_reawakened_later(harness):
+    async def stop(event):
+        event.stop_event()
+
+    handler = copy(harness.adapter)
+    handler.handler_name = "other_plugin_stop"
+    handler.handler = stop
+    handler.extras_configs = {"priority": -100}
+    harness.handlers.append(handler)
+    event = make_event()
+    await harness.run(event)
+    assert event.get_extra(RECORD_KEY).status == "ignored"
+    group = harness.plugin.controller.groups[KEY]
+    await eventually(lambda: group.worker is None)
+    assert not group.pending
+    harness.plugin.client._send.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "harness",
+    [
+        {"keyword_wake": {"keywords": ["小爱"]}},
+        {
+            "keyword_wake": {"keywords": ["小爱"]},
+            "semantic": {"jev_api_key": ""},
+        },
+        {
+            "keyword_wake": {"keywords": ["小爱"]},
+            "semantic": {"jev_api_key": " \n "},
+        },
+        {
+            "keyword_wake": {"keywords": ["小爱"]},
+            "semantic": {"enabled": False},
+        },
+        {
+            "keyword_wake": {"keywords": ["小爱"]},
+            "semantic": {"enabled": False, "jev_api_key": "test"},
+        },
+    ],
+    indirect=True,
+)
+async def test_disabled_semantics_keeps_direct_wakes_and_history(harness):
+    assert harness.plugin.observer.installed
+    assert harness.plugin.active
+    assert not harness.plugin.semantic_enabled
+    harness.plugin.controller.awakened(KEY)
+    for i in range(35):
+        await harness.run(make_event(f"普通消息{i}"))
+    group = harness.plugin.controller.groups[KEY]
+    assert len(group.history) == 30
+    assert not group.pending
+    assert not group.inflight
+    assert group.deadline is None
+    assert group.worker is None
+    assert not harness.plugin.controller.tasks
+    assert not harness.requests
+
+    for event in (
+        make_event("小爱，请回答"),
+        make_event("你好", parts=[At(qq="300"), Plain("你好")]),
+        make_event("追问", parts=[Reply(id="42", sender_id="300"), Plain("追问")]),
+    ):
+        await harness.run(event)
+        assert harness.requests[-1] is event
+    assert len(harness.requests) == 3
+    assert group.awake_until == 280
+    await harness.run(make_event("普通追问"))
+    assert not group.pending
+    assert group.worker is None
+    assert len(harness.requests) == 3
+    assert await harness.plugin._judge(KEY, [], [], lambda _: True) == {}
+    harness.plugin.client._send.assert_not_called()
+    assert harness.plugin.client.session is None
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_missing_key_notice_only_when_semantics_enabled(monkeypatch, enabled):
+    warning = MagicMock()
+    monkeypatch.setattr(main.logger, "warning", warning)
+    plugin = QQGroupEnhancePlugin(SimpleNamespace(), {"semantic": {"enabled": enabled}})
+    try:
+        await plugin.initialize()
+        assert plugin.active
+        assert plugin.observer.installed
+        assert warning.call_count == int(enabled)
+        if enabled:
+            assert "jev_api_key" in warning.call_args.args[0]
+            assert "插件已加载" in warning.call_args.args[0]
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.parametrize(
+    "harness",
+    [
+        {
+            "keyword_wake": {"keywords": ["小爱"]},
+            "semantic": {"enabled": False},
+        },
+        {
+            "keyword_wake": {"keywords": ["小爱"]},
+            "semantic": {"enabled": False, "jev_api_key": "test"},
+        },
+    ],
+    indirect=True,
+)
+async def test_disabled_semantics_retains_bot_history_and_distance_without_window(
+    harness,
+):
+    # Direct wakes and caching also work without native group context injection.
+    harness.config["provider_ltm_settings"]["group_icl_enable"] = False
+    seed = await harness.run(make_event("背景消息"))
+    await seed.send(seed.plain_result("机器人最近发言"))
+    group = harness.plugin.controller.groups[KEY]
+    assert group.awake_until == 0
+    assert group.last_bot_sequence == 2
+    for i in range(6):
+        event = await harness.run(make_event(f"普通消息{i}"))
+        assert event.get_extra(RECORD_KEY).status == "background"
+    assert group.sequence == 8
+    assert any(m.bot and m.text == "机器人最近发言" for m in group.history.values())
+    assert len(group.history) == 8
+    assert not group.pending
+    assert not group.inflight
+    assert group.deadline is None
+    assert group.worker is None
+    assert not harness.plugin.controller.tasks
+    assert not await harness.plugin._session_eligible(
+        event, event.get_extra(RECORD_KEY)
+    )
+    assert not await harness.plugin._semantic_wake(
+        KEY, group, [event.get_extra(RECORD_KEY)]
+    )
+    assert not harness.plugin.replies.tasks
+    harness.auto_send = True
+    for event in (
+        make_event("小爱，请回答"),
+        make_event("你好", parts=[At(qq="300"), Plain("你好")]),
+        make_event("追问", parts=[Reply(id="42", sender_id="300"), Plain("追问")]),
+    ):
+        assert harness.plugin.explicit(event)
+        await harness.run(event)
+        assert harness.requests[-1] is event
+    assert len(harness.requests) == 3
+    assert len(harness.bot.calls) == 4
+    assert group.awake_until == 280
+    assert any(m.bot and m.text == "模型回复" for m in group.history.values())
+    harness.plugin.client._send.assert_not_called()
+    assert harness.plugin.client.session is None
+
+
+@pytest.mark.usefixtures("awake_group")
+@pytest.mark.parametrize("phase", ["window", "retry", "result"])
+async def test_disabled_semantics_blocks_pending_judgment_and_wake(
+    harness, monkeypatch, phase
+):
+    event = await harness.run(make_event("普通追问"))
+    group = harness.plugin.controller.groups[KEY]
+
+    def disable():
+        monkeypatch.setattr(
+            harness.plugin, "settings", replace(harness.plugin.settings, enabled=False)
+        )
+
+    async def send(payload):
+        disable()
+        if phase == "retry":
+            raise TimeoutError()
+        return {
+            "answers": {
+                key: {"type": "noul", "noul": 0.99} for key in payload["questions"]
+            }
+        }
+
+    harness.plugin.client._send = AsyncMock(side_effect=send)
+    if phase == "window":
+        disable()
+    harness.clock.now = 105
+    group.changed.set()
+    await eventually(lambda: group.worker is None)
+    assert harness.plugin.client._send.await_count == (0 if phase == "window" else 1)
+    assert not group.pending
+    assert not group.inflight
+    assert not group.reserved
+    assert not harness.plugin.replies.tasks
+    assert not harness.requests
+    assert event.get_extra(RECORD_KEY).id in group.history
+    await harness.run(make_event("小爱，直接唤醒"))
+    assert len(harness.requests) == 1
+
+
+@pytest.mark.usefixtures("awake_group")
+@pytest.mark.parametrize("phase", ["queued", "submit"])
+async def test_disabled_semantics_blocks_queued_reply_before_provider(
+    harness, monkeypatch, phase
+):
+    event = await harness.run(make_event("普通追问"))
+
+    def disable():
+        monkeypatch.setattr(
+            harness.plugin, "settings", replace(harness.plugin.settings, enabled=False)
+        )
+
+    if phase == "submit":
+
+        async def before_submit(event, runner):
+            disable()
+
+        harness.before_submit = before_submit
+    request = await schedule_reply(harness, event)
+    if phase == "queued":
+        disable()
+    await harness.settle()
+    assert request.event.is_stopped()
+    assert not harness.payloads
+    assert not harness.bot.calls
+    assert not request.group.reserved
+
+
+@pytest.mark.parametrize(
+    "harness",
+    [
+        {"semantic": {"jev_threshold": 0}},
+        {"semantic": {"jev_threshold": "0.75"}},
+        {"semantic": {"jev_threshold": 2}},
+        {"semantic": {"awake_observe_seconds": 0}},
+        {"semantic": {"max_messages_after_bot": 0}},
+        {"asleep_observe_seconds": 10},
+        {"semantic": {"history_messages": 0}},
+        {"keyword_wake": {"keywords": [""]}},
+        {"keyword_wake": {"keyword_ignore_case": "true"}},
+        {"keyword_wake": {"keyword_case_sensitive": True}},
+        {"keyword_wake": []},
+        {"keyword_wake": {"enabled": True}},
+        {"keywords": ["test"]},
+        {"semantic": {"enabled": "true"}},
+        {"semantic": {"jev_model": "jev-latest"}},
+        {"semantic": {"jev_api_key": None}},
+        {"semantic": {"jev_api_url": "not-a-url"}},
+        {"semantic": []},
+        {"semantic": {"keywords": ["test"]}},
+        {"enabled": False},
+        {"jev_api_key": "test-secret"},
+        {"traffic_window_minutes": 10},
+        {"unknown_field": 1},
+    ],
+    indirect=True,
+)
+async def test_invalid_config_keeps_plugin_loaded_and_core_messages_working(harness):
+    plugin = harness.plugin
+    assert plugin.config_error
+    assert GroupWakeFilter.plugin is plugin
+    assert not plugin.active
+    assert plugin.settings is None
+    assert plugin.client is None
+    assert plugin.controller is None
+    assert not plugin.observer.installed
+    assert not plugin.observer.patches
+    event = make_event("小爱")
+    assert not GroupWakeFilter().filter(event, harness.config)
+    await harness.run(event)
+    assert not harness.requests
+    assert event.get_extra(RECORD_KEY) is None
+    assert await plugin._judge(KEY, [], [], lambda _: True) == {}
+
+    # Core wake/reply remains usable while this plugin's settings are invalid.
+    mention = make_event("你好", parts=[At(qq="300"), Plain("你好")])
+    await harness.run(mention)
+    assert harness.requests == [mention]
+    assert not plugin.session_groups
+    await plugin.terminate()
+    assert GroupWakeFilter.plugin is None
+
+
+async def test_invalid_config_logs_reason_preserves_values_and_recovers_on_reload(
+    monkeypatch,
+):
+    error_log = MagicMock()
+    monkeypatch.setattr(main.logger, "error", error_log)
+    config = {"semantic": {"jev_api_key": "test-secret", "jev_threshold": 0}}
+    original = deepcopy(config)
+    plugin = QQGroupEnhancePlugin(SimpleNamespace(), config)
+    try:
+        await plugin.initialize()
+        assert "jev_threshold" in plugin.config_error
+        assert config == original
+        error_log.assert_called_once()
+        rendered = error_log.call_args.args[0] % error_log.call_args.args[1:]
+        assert "插件已加载" in rendered
+        assert "WebUI" in rendered
+        assert "jev_threshold" in rendered
+        assert "test-secret" not in rendered
+    finally:
+        await plugin.terminate()
+    config["semantic"]["jev_threshold"] = 0.9
+    reloaded = QQGroupEnhancePlugin(SimpleNamespace(), config)
+    try:
+        await reloaded.initialize()
+        assert reloaded.active
+        assert reloaded.config_error is None
+        assert reloaded.settings.jev_threshold == 0.9
+        assert reloaded.observer.installed
+        assert reloaded.client is not None
+        assert reloaded.controller is not None
+    finally:
+        await reloaded.terminate()
+
+
+@pytest.mark.parametrize("config", [[], "invalid", {1: True}])
+async def test_malformed_config_object_is_reported_without_failing_load(config):
+    plugin = QQGroupEnhancePlugin(SimpleNamespace(), config)
+    try:
+        await plugin.initialize()
+        assert plugin.config_error
+        assert not plugin.active
+        assert plugin.settings is None
+        assert not plugin.observer.installed
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_event_bus_only_dispatches_real_messages_and_logs_reply_request(
+    harness, webui_logs
+):
+    bus = EventBus(
+        harness.queue,
+        {"test": SimpleNamespace(execute=harness.run)},
+        SimpleNamespace(get_conf_info=lambda _: {"id": "test", "name": "default"}),
+    )
+    dispatch = asyncio.create_task(bus.dispatch())
+    event = make_event("你在干嘛", mid="501")
+    try:
+        await harness.queue.put(event)
+        await eventually(
+            lambda: bool(event.get_extra(RECORD_KEY)) and not bus._pending_tasks
+        )
+        harness.plugin.client._send = AsyncMock(
+            return_value={
+                "model": "jev-1.13.0",
+                "usage": {"input_tokens": 123},
+                "answers": {"q0": {"type": "noul", "noul": 0.96}},
+            }
+        )
+        group = harness.plugin.controller.groups[KEY]
+        harness.clock.now = 110
+        group.changed.set()
+        await eventually(lambda: len(harness.payloads) == 1 and not bus._pending_tasks)
+
+        # A real second message, even with identical text, still logs normally.
+        duplicate_text = make_event("你在干嘛", mid="502")
+        await harness.queue.put(duplicate_text)
+        await eventually(
+            lambda: (
+                bool(duplicate_text.get_extra(RECORD_KEY)) and not bus._pending_tasks
+            )
+        )
+        entries = list(webui_logs)
+        incoming = [e for e in entries if "你在干嘛" in e["data"]]
+        assert len(incoming) == 2
+        assert all(e["category"] == "user_chat" for e in incoming)
+        replays = [e for e in entries if "Jev 请求回复" in e["data"]]
+        assert len(replays) == 1
+        assert "message_id=501" in replays[0]["data"]
+        assert "group=100" in replays[0]["data"]
+        assert replays[0]["category"] == "system"
+        assert any("Jev 判断完成" in e["data"] for e in entries)
+        assert any(
+            "Jev 唤醒汇总" in e["data"] and "新增唤醒=是" in e["data"] for e in entries
+        )
+        assert len(harness.requests) == 1
+        assert event.get_extra(RECORD_KEY).status == "covered"
+        assert duplicate_text.get_extra(RECORD_KEY).status == "pending"
+        assert len(harness.native.raw_records[event.unified_msg_origin]) == 1
+    finally:
+        dispatch.cancel()
+        await asyncio.gather(dispatch, return_exceptions=True)
+        await asyncio.gather(*bus._pending_tasks, return_exceptions=True)
+
+
+def add_inbound(harness, handler, priority=10):
+    registered = copy(harness.adapter)
+    registered.handler_name = handler.__name__
+    registered.handler = handler
+    registered.extras_configs = {"priority": priority}
+    harness.handlers.append(registered)
+
+
+async def schedule_reply(harness, event):
+    group = harness.plugin.controller.groups[KEY]
+    assert await harness.plugin._semantic_wake(
+        KEY, group, [event.get_extra(RECORD_KEY)]
+    )
+    return next(reversed(harness.plugin.replies.tasks.values()))
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_reply_reuses_prepared_message_without_repeating_inbound(
+    harness, monkeypatch
+):
+    stage = next(s for s in harness.scheduler.stages if isinstance(s, PreProcessStage))
+    preprocess = AsyncMock(wraps=stage.process)
+    monkeypatch.setattr(stage, "process", preprocess)
+    handled = []
+
+    async def enrich(event):
+        handled.append(event.message_obj.message_id)
+        event.message_str += " [prepared]"
+        event.message_obj.message.append(Plain("[prepared]"))
+        event.set_extra("selected_model", "test-model")
+
+    add_inbound(harness, enrich)
+    event = make_event("hello")
+    await harness.run(event)
+    ids_before = list(harness.native._record_ids[event.unified_msg_origin])
+    request = await schedule_reply(harness, event)
+    await harness.settle()
+    assert handled == [event.message_obj.message_id]
+    assert preprocess.await_count == 1
+    assert harness.queue.empty()
+    assert len(harness.payloads) == 1
+    assert request.event.message_str == "hello [prepared]"
+    assert request.event.get_extra("selected_model") == "test-model"
+    assert request.event.get_extra("activated_handlers") is None
+    assert request.source.native_record_id == ids_before[0]
+    assert not harness.native.raw_records[event.unified_msg_origin]
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_reply_runs_decoration_send_hooks_and_renews_awake(harness):
+    event = make_event()
+    await harness.run(event)
+    harness.auto_send = True
+    harness.decorate.reply_prefix = "PREFIX: "
+    sent = []
+
+    async def after_send(event):
+        sent.append(event.message_obj.message_id)
+
+    handler = copy(harness.adapter)
+    handler.event_type = EventType.OnAfterMessageSentEvent
+    handler.handler_name = "after_send"
+    handler.handler = after_send
+    harness.handlers.append(handler)
+
+    async def before_submit(event, runner):
+        assert harness.plugin.controller.groups[KEY].awake_until == 280
+        harness.clock.now = 125
+
+    harness.before_submit = before_submit
+    await schedule_reply(harness, event)
+    await harness.settle()
+    assert len(harness.bot.calls) == 1
+    assert "PREFIX:" in str(harness.bot.calls)
+    assert sent == [event.message_obj.message_id]
+    assert harness.plugin.controller.groups[KEY].awake_until == 305
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.usefixtures("awake_group")
+async def test_covered_during_preparation_never_calls_provider(harness, streaming):
+    event = make_event()
+    await harness.run(event)
+
+    async def cover(event, runner):
+        runner.streaming = streaming
+        harness.plugin.controller.covered(KEY, {event.get_extra(RECORD_KEY).id})
+
+    harness.before_submit = cover
+    request = await schedule_reply(harness, event)
+    await harness.settle()
+    assert not harness.payloads
+    assert not harness.bot.calls
+    assert request.event.is_stopped()
+    assert not harness.plugin.controller.groups[KEY].reserved
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_real_agent_rechecks_after_session_lock_before_build(harness):
+    from astrbot.core.pipeline.process_stage.method.agent_request import (
+        AgentRequestSubStage,
+    )
+    from astrbot.core.utils.session_lock import session_lock_manager
+
+    event = make_event()
+    await harness.run(event)
+    stage = AgentRequestSubStage()
+    await stage.initialize(harness.scheduler.ctx)
+    harness.process.agent_sub_stage = stage
+    entered = asyncio.Event()
+
+    async def typing():
+        entered.set()
+
+    event.send_typing = typing
+    async with session_lock_manager.acquire_lock(event.unified_msg_origin):
+        request = await schedule_reply(harness, event)
+        await asyncio.wait_for(entered.wait(), 2)
+        assert not request.event.is_stopped()
+        harness.plugin.controller.covered(KEY, {event.get_extra(RECORD_KEY).id})
+    await harness.settle()
+    assert request.event.is_stopped()
+    assert not harness.bot.calls
+    assert not harness.payloads
+    # The obsolete reply must not consume native context while preparing input.
+    assert len(harness.native.raw_records[event.unified_msg_origin]) == 1
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_missing_native_id_does_not_consume_later_messages(harness):
+    event = make_event("old")
+    await harness.run(event)
+    request = await schedule_reply(harness, event)
+    umo = event.unified_msg_origin
+    harness.native.raw_records[umo].clear()
+    harness.native._record_ids[umo].clear()
+    harness.native.raw_records[umo].append("new unrelated input")
+    harness.native._record_ids[umo].append("new-id")
+    await harness.settle()
+    assert request.event.is_stopped()
+    assert not harness.payloads
+    assert list(harness.native.raw_records[umo]) == ["new unrelated input"]
+
+
+@pytest.mark.parametrize("ending", ["reply", "negative", "failed", "reset", "unload"])
+@pytest.mark.usefixtures("awake_group")
+async def test_prepared_media_lives_until_reply_or_candidate_finishes(
+    harness, tmp_path, ending
+):
+    from astrbot.api.message_components import Image
+
+    path = tmp_path / "prepared.png"
+    path.write_bytes(b"temporary image fixture")
+
+    async def prepare(event):
+        event.message_obj.message.append(Image(file=str(path)))
+        event.track_temporary_local_file(str(path))
+
+    add_inbound(harness, prepare)
+    event = make_event("image")
+    await harness.run(event)
+    record = event.get_extra(RECORD_KEY)
+    assert path.exists()
+    assert record.media_owner is not None
+    assert event._temporary_local_files == []
+    if ending == "reply":
+
+        async def verify(event, runner):
+            assert path.exists()
+            assert event._temporary_local_files == [str(path)]
+            assert event.get_messages()[-1].file == str(path)
+
+        harness.before_submit = verify
+        await schedule_reply(harness, event)
+        await harness.settle()
+        assert len(harness.payloads) == 1
+    elif ending in ("negative", "failed"):
+        harness.plugin.controller.judge = AsyncMock(
+            return_value={record.id: 0.1} if ending == "negative" else {}
+        )
+        group = harness.plugin.controller.groups[KEY]
+        harness.clock.now = 110
+        group.changed.set()
+        await eventually(lambda: group.worker is None)
+    elif ending == "reset":
+        ActiveEventRegistry().stop_all(event.unified_msg_origin)
+    else:
+        await harness.plugin.terminate()
+    assert not path.exists()
+    assert record.media_owner is None
+
+
+@pytest.mark.parametrize("ending", ["reset", "unload", "error"])
+@pytest.mark.usefixtures("awake_group")
+async def test_running_reply_cancellation_and_failure_release_resources(
+    harness, tmp_path, ending
+):
+    from astrbot.core.utils.active_event_registry import active_event_registry
+
+    path = tmp_path / "reply-resource.tmp"
+    path.write_bytes(b"resource")
+    event = make_event()
+    event.track_temporary_local_file(str(path))
+    await harness.run(event)
+    entered = asyncio.Event()
+
+    async def pause(event, runner):
+        entered.set()
+        if ending == "error":
+            raise RuntimeError("preparation failed")
+        await asyncio.Event().wait()
+
+    harness.before_submit = pause
+    request = await schedule_reply(harness, event)
+    await asyncio.wait_for(entered.wait(), 2)
+    if ending == "reset":
+        active_event_registry.stop_all(event.unified_msg_origin)
+    elif ending == "unload":
+        await harness.plugin.terminate()
+    await harness.settle()
+    assert not path.exists()
+    assert not request.group.reserved
+    assert not harness.payloads
+    assert event.unified_msg_origin not in active_event_registry._events
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_reply_can_continue_tool_rounds_after_its_own_coverage(harness):
+    event = make_event()
+    await harness.run(event)
+    ordinary_request = harness.process.agent_sub_stage.process
+
+    async def two_rounds(event):
+        async for _ in ordinary_request(event):
+            yield
+        token = ACTIVE_RUN.set((harness.plugin.observer, event))
+        try:
+            await harness.provider.text_chat(contexts=[])
+        finally:
+            ACTIVE_RUN.reset(token)
+
+    harness.process.agent_sub_stage.process = two_rounds
+    await schedule_reply(harness, event)
+    await harness.settle()
+    assert len(harness.payloads) == 2
+    assert event.get_extra(RECORD_KEY).status == "covered"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.usefixtures("awake_group")
+async def test_real_agent_reply_sends_then_saves_history(
+    harness, monkeypatch, streaming
+):
+    from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal
+
+    event = make_event()
+    await harness.run(event)
+    stage = AgentRequestSubStage()
+    await stage.initialize(harness.scheduler.ctx)
+    agent = stage.agent_sub_stage
+    agent.streaming_response = streaming
+    agent.unsupported_streaming_strategy = "collect"
+    saved = AsyncMock()
+    agent._save_to_history = saved
+    harness.process.agent_sub_stage = stage
+    harness.config["provider_settings"]["unsupported_streaming_strategy"] = "collect"
+    harness.provider.get_model = lambda: "test-model"
+    harness.provider.meta = lambda: SimpleNamespace(type="test")
+    response = LLMResponse(role="assistant", completion_text="normal reply")
+    runner = SimpleNamespace(
+        done=lambda: True,
+        was_aborted=lambda: False,
+        get_final_llm_resp=lambda: response,
+        request_stop=lambda: None,
+        stats=SimpleNamespace(to_dict=lambda: {}),
+        provider=harness.provider,
+    )
+
+    async def build(*, event, **kwargs):
+        req = ProviderRequest(prompt=event.message_str, conversation=None)
+        await harness.native.on_req_llm(event, req)
+        runner.run_context = SimpleNamespace(
+            context=SimpleNamespace(event=event),
+            messages=[Message.model_validate(await req.assemble_context())],
+        )
+        return SimpleNamespace(
+            agent_runner=runner,
+            provider_request=req,
+            provider=harness.provider,
+            reset_coro=None,
+        )
+
+    async def generate(runner, *args, **kwargs):
+        reply_event = runner.run_context.context.event
+        await call_event_hook(
+            reply_event, EventType.OnAgentBeginEvent, runner.run_context
+        )
+        token = ACTIVE_RUN.set((harness.plugin.observer, reply_event))
+        try:
+            harness.plugin.observer.watch_provider(harness.provider)
+            await harness.provider.text_chat(contexts=runner.run_context.messages)
+        finally:
+            ACTIVE_RUN.reset(token)
+        await call_event_hook(reply_event, EventType.OnLLMResponseEvent, response)
+        harness.clock.now = 130
+        chain = MessageChain([Plain(response.completion_text)])
+        if streaming:
+            yield chain
+        else:
+            result = reply_event.chain_result(chain.chain)
+            result.result_content_type = ResultContentType.LLM_RESULT
+            reply_event.set_result(result)
+            yield
+        if not streaming:
+            assert harness.bot.calls
+        reply_event.clear_result()
+
+    harness.plugin.observer.patch(
+        internal,
+        "build_main_agent",
+        lambda original: harness.plugin.observer._build_agent(build),
+    )
+    monkeypatch.setattr(internal, "run_agent", generate)
+    monkeypatch.setattr(internal, "_record_internal_agent_stats", AsyncMock())
+    request = await schedule_reply(harness, event)
+    await harness.settle()
+    assert not request.event.is_stopped()
+    assert len(harness.payloads) == 1
+    assert len(harness.bot.calls) == 1
+    assert saved.await_count >= 1
+    assert harness.plugin.controller.groups[KEY].awake_until == 310
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_first_semantic_reply_keeps_new_conversation_identity(harness):
+    from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal
+    from astrbot_plugin_qq_group_enhance.main import CID_KEY
+
+    manager = harness.context.conversation_manager
+    manager.get_curr_conversation_id.return_value = None
+
+    async def create(*args):
+        manager.get_curr_conversation_id.return_value = "created-by-reply"
+        return "created-by-reply"
+
+    manager.new_conversation = AsyncMock(side_effect=create)
+    event = make_event()
+    await harness.run(event)
+    stage = AgentRequestSubStage()
+    await stage.initialize(harness.scheduler.ctx)
+    harness.process.agent_sub_stage = stage
     seen = []
 
-    async def debounce_handler(event):
-        await debouncer.capture(event)
-        seen.append(event.get_extra(ARRIVAL_KEY).batch)
+    async def build(*, event, **kwargs):
+        seen.append(event.get_extra(CID_KEY))
+        assert await harness.plugin.replies.eligible(event)
+        return None
 
-    handler = copy(harness.handlers[0])
-    handler.handler = debounce_handler
-    handler.event_filters = [ArrivalFilter()]
+    harness.plugin.observer.patch(
+        internal,
+        "build_main_agent",
+        lambda original: harness.plugin.observer._build_agent(build),
+    )
+    await schedule_reply(harness, event)
+    await harness.settle()
+    assert seen == ["created-by-reply"]
+    assert manager.new_conversation.await_count == 1
+    assert event.get_extra(CID_KEY) is None
+
+
+async def test_asleep_recent_bot_send_limits_candidates_and_semantic_wake(harness):
+    seed = await harness.run(make_event("背景消息", mid="seed"))
+    await seed.send(seed.plain_result("机器人发言"))
+    group = harness.plugin.controller.groups[KEY]
+    assert group.awake_until == 0
+    assert group.last_bot_sequence == 2
+    events = [make_event(f"追问{i}", mid=str(i)) for i in range(1, 7)]
+    for event in events[:5]:
+        await harness.run(event)
+    # OneBot's later echo of a successful send must not reset the distance.
+    await harness.run(
+        make_event("机器人发言", sender="300", mid="10001", post_type="message_sent")
+    )
+    await harness.run(events[5])
+    assert group.last_bot_sequence == 2
+    assert group.sequence == 8
+    assert list(group.pending) == [str(i) for i in range(1, 6)]
+    assert events[5].get_extra(RECORD_KEY).status == "background"
+    assert group.deadline == 105
+    assert not harness.requests
+
+    async def send(payload):
+        assert [m["message_id"] for m in payload["state"]["candidates"]] == [
+            str(i) for i in range(1, 6)
+        ]
+        return {
+            "answers": {
+                k: {"type": "noul", "noul": 0.99 if k == "q0" else 0.1}
+                for k in payload["questions"]
+            }
+        }
+
+    harness.plugin.client._send = AsyncMock(side_effect=send)
+    harness.clock.now = 105
+    group.changed.set()
+    await eventually(lambda: group.worker is None)
+    await harness.settle()
+    assert harness.plugin.client._send.await_count == 1
+    assert len(harness.requests) == 1
+    assert group.awake_until == 285
+    assert not group.pending
+    assert all(e.get_extra(RECORD_KEY).status == "covered" for e in events[:5])
+
+
+async def test_failed_send_does_not_create_distance_anchor(harness):
+    seed = await harness.run(make_event("背景消息", mid="seed"))
+    group = harness.plugin.controller.groups[KEY]
+    harness.bot.fail_at = 1
+    with pytest.raises(RuntimeError, match="OneBot"):
+        await seed.send(seed.plain_result("发送失败"))
+    event = await harness.run(make_event("追问"))
+    assert group.last_bot_sequence is None
+    assert event.get_extra(RECORD_KEY).status == "background"
+    assert group.worker is None
+    await seed.send(seed.plain_result("发送成功"))
+    assert group.last_bot_sequence == 3
+    assert group.awake_until == 0
+    await harness.run(make_event("再次追问"))
+    assert len(group.pending) == 1
+
+
+async def test_command_arrival_counts_once_without_becoming_candidate(harness):
+    await harness.run(make_event("机器人发言", sender="300", mid="anchor"))
+    calls = []
+
+    async def command(event):
+        calls.append(event.message_str)
+
+    handler = copy(harness.adapter)
+    handler.handler_name = "command"
+    handler.handler = command
+    handler.extras_configs = {"priority": 1}
+    handler.event_filters = [
+        CommandFilter(
+            "help", handler_md=SimpleNamespace(handler=lambda self, event: None)
+        )
+    ]
     harness.handlers.append(handler)
-    event = make_event("小爱，你好")
-    await asyncio.create_task(harness.run(event))
-    assert seen == [[event.get_extra(ARRIVAL_KEY)]]
-    assert harness.requests == [event]
+    await harness.run(make_event("/help", mid="command"))
+    group = harness.plugin.controller.groups[KEY]
+    assert group.sequence == 2
+    assert group.last_bot_sequence == 1
+    assert calls == ["help"]
+    assert "command" not in group.records()
+    # Commands can wake the core. Let that awake interval expire; its message
+    # still consumed one of the five positions after the bot's last send.
+    harness.clock.now = 281
+    for i in range(1, 6):
+        await harness.run(make_event(f"群聊{i}", mid=str(i)))
+    assert list(group.pending) == ["1", "2", "3", "4"]
+    assert group.history["5"].status == "background"

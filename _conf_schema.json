@@ -1,34 +1,130 @@
 {
-  "enabled": {
-    "type": "bool", "description": "启用群聊增强", "default": true
+  "keyword_wake": {
+    "type": "object",
+    "description": "关键词唤醒",
+    "default": {},
+    "items": {
+      "keywords": {
+        "type": "list",
+        "description": "直接唤醒关键词",
+        "default": [],
+        "hint": "包含任意关键词即唤醒，留空关闭。请勿与 AstrBot 自带唤醒前缀重复配置。"
+      },
+      "keyword_ignore_case": {
+        "type": "bool",
+        "description": "关键词不区分大小写",
+        "default": true
+      }
+    }
   },
-  "keywords": {
-    "type": "list", "description": "唤醒关键词", "default": ["小爱"],
-    "hint": "消息正文包含任意关键词即可唤醒，并保留关键词；大小写规则由下方开关控制，空列表仅保留 @ 唤醒。请将这些关键词从 AstrBot 自带唤醒前缀中移除，避免被核心提前删除。"
-  },
-  "keyword_case_sensitive": {
-    "type": "bool", "description": "关键词区分大小写", "default": true,
-    "hint": "关闭后 Airi、airi、AIRI 均可匹配同一关键词。仅影响匹配，发给模型的原文保持不变。"
-  },
-  "traffic_window_minutes": {
-    "type": "int", "description": "流量统计窗口（分钟）", "default": 10,
-    "minimum": 1, "maximum": 1440,
-    "hint": "每分钟移除最早计数、加入刚结束分钟的计数；没有消息的分钟按 0 结算。"
-  },
-  "low_max_messages": {
-    "type": "int", "description": "低流量消息数上限", "default": 15,
-    "minimum": 0, "hint": "不超过此值时，全群共享清醒窗口。"
-  },
-  "medium_max_messages": {
-    "type": "int", "description": "中流量消息数上限", "default": 30,
-    "minimum": 1, "hint": "必须大于低流量上限。中流量按用户清醒；超过此值每次必须关键词或 @。"
-  },
-  "awake_window_seconds": {
-    "type": "float", "description": "清醒窗口（秒）", "default": 180.0,
-    "hint": "正数。关键词或 @机器人 刷新窗口；普通续聊不延长。低流量任何群员可刷新共享窗口，中流量只刷新自己。"
-  },
-  "count_bot_messages": {
-    "type": "bool", "description": "将机器人自身消息计入流量", "default": false,
-    "hint": "仅统计平台实际送达插件的消息。无论是否计数，机器人自身消息均不会由本插件唤醒。"
+  "semantic": {
+    "type": "object",
+    "description": "Jev 语义唤醒",
+    "hint": "修改后保存并重载插件生效。",
+    "default": {},
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用 Jev 语义判断",
+        "default": true,
+        "hint": "仅控制语义判断，不影响关键词、@和引用唤醒。需开启 AstrBot 的“群聊消息记录注入上下文”。"
+      },
+      "jev_api_url": {
+        "type": "string",
+        "description": "Jev 请求地址",
+        "default": "https://api.typesafe.ai/v1/systemone",
+        "condition": {
+          "enabled": true
+        },
+        "hint": "填写兼容 Jev 的完整 HTTP(S) 接口地址，不会自动追加路径。"
+      },
+      "jev_api_key": {
+        "type": "string",
+        "description": "TypeSafe AI / Jev API Key",
+        "default": "",
+        "condition": {
+          "enabled": true
+        },
+        "hint": "留空暂停语义判断。群聊内容会发送到配置的请求地址。"
+      },
+      "jev_model": {
+        "type": "string",
+        "description": "Jev 固定模型版本",
+        "default": "jev-1.13.0",
+        "condition": {
+          "enabled": true
+        },
+        "hint": "填写固定版本号，如 jev-1.13.0，不支持 latest 或 preview。"
+      },
+      "awake_window_seconds": {
+        "type": "float",
+        "description": "群共享清醒时长（秒）",
+        "default": 180.0,
+        "condition": {
+          "enabled": true
+        },
+        "hint": "进入清醒后的持续时间；模型回复成功发送后刷新。"
+      },
+      "awake_observe_seconds": {
+        "type": "float",
+        "description": "Jev 消息聚合窗口（秒）",
+        "default": 5.0,
+        "condition": {
+          "enabled": true
+        },
+        "hint": "从首条待判消息起计时，到期后统一判断；新消息不延长窗口。须大于 0。"
+      },
+      "max_messages_after_bot": {
+        "type": "int",
+        "description": "非清醒时距机器人最近发言的最大消息条数",
+        "default": 5,
+        "condition": {
+          "enabled": true
+        },
+        "minimum": 1,
+        "maximum": 1000,
+        "hint": "仅检测机器人最近发言后的前几条消息；清醒时不受限制。"
+      },
+      "history_messages": {
+        "type": "int",
+        "description": "Jev 历史消息缓存条数",
+        "default": 30,
+        "condition": {
+          "enabled": true
+        },
+        "minimum": 1,
+        "maximum": 1000,
+        "hint": "用于 Jev 判断的历史消息条数，不含待判消息；重载后清空。"
+      },
+      "jev_threshold": {
+        "type": "float",
+        "description": "逐条语义判断通过阈值",
+        "default": 0.75,
+        "condition": {
+          "enabled": true
+        },
+        "hint": "大于 0 且不超过 1；值越高，唤醒判断越保守。"
+      },
+      "jev_timeout_seconds": {
+        "type": "float",
+        "description": "Jev 单次请求超时（秒）",
+        "default": 10.0,
+        "condition": {
+          "enabled": true
+        },
+        "hint": "每次请求独立计时，超时后按重试次数处理。"
+      },
+      "jev_retries": {
+        "type": "int",
+        "description": "Jev 失败后的重试次数",
+        "default": 1,
+        "condition": {
+          "enabled": true
+        },
+        "minimum": 0,
+        "maximum": 3,
+        "hint": "失败后的额外尝试次数，设为 0 不重试。"
+      }
+    }
   }
 }
