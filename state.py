@@ -27,6 +27,7 @@ RETIRED = {
 
 @dataclass(frozen=True)
 class Settings:
+    group_whitelist: tuple[str, ...] = ()
     enabled: bool = True
     keywords: tuple[str, ...] = ()
     keyword_ignore_case: bool = True
@@ -71,7 +72,7 @@ class Settings:
         if retired:
             raise ValueError("请删除废弃配置：" + ", ".join(sorted(retired)))
         direct_fields = {"keywords", "keyword_ignore_case"}
-        root_fields = {"preserve_bot_mention"}
+        root_fields = {"group_whitelist", "preserve_bot_mention"}
         semantic_fields = cls.__dataclass_fields__.keys() - direct_fields - root_fields
         for name, fields in (
             ("keyword_wake", direct_fields),
@@ -99,6 +100,19 @@ class Settings:
         for name in ("enabled", "keyword_ignore_case", "preserve_bot_mention"):
             if type(values[name]) is not bool:
                 raise ValueError(f"{name} 必须为布尔值")
+        whitelist = values["group_whitelist"]
+        if not isinstance(whitelist, (list, tuple)) or any(
+            not isinstance(group_id, str)
+            or not re.fullmatch(r"[1-9][0-9]*", group_id.strip())
+            for group_id in whitelist
+        ):
+            raise ValueError(
+                "group_whitelist 必须为 QQ 群号字符串列表（正整数字符串），"
+                "可设为空列表表示不限制群聊"
+            )
+        values["group_whitelist"] = tuple(
+            dict.fromkeys(group_id.strip() for group_id in whitelist)
+        )
         for name in (
             "awake_window_seconds",
             "debounce_seconds",

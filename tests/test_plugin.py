@@ -315,6 +315,114 @@ def awake_group(harness):
 
 
 @pytest.mark.parametrize(
+    "harness,allowed",
+    [
+        (
+            {
+                "group_whitelist": whitelist,
+                "keyword_wake": {"keywords": ["小爱"]},
+                "semantic": {"jev_api_key": "test"},
+            },
+            allowed,
+        )
+        for whitelist, allowed in (
+            ([], True),
+            (["100"], True),
+            (["999", "100"], True),
+            (["999"], False),
+            (["1000"], False),
+        )
+    ],
+    indirect=["harness"],
+)
+async def test_group_whitelist_scopes_observation_and_preserves_core_wake(
+    harness, allowed
+):
+    plugin = harness.plugin
+    observer_filter = GroupWakeFilter()
+    keyword = make_event("小爱")
+    assert observer_filter.filter(keyword, harness.config) is allowed
+    assert (
+        observer_filter.filter(make_event(platform="qq-2"), harness.config) is allowed
+    )
+    assert not observer_filter.filter(make_event(private=True), harness.config)
+
+    bot = await harness.run(
+        make_event("机器人发言", sender="300", post_type="message_sent")
+    )
+    await harness.run(keyword)
+    assert keyword.is_at_or_wake_command is allowed
+    assert harness.requests == ([keyword] if allowed else [])
+
+    mention = await harness.run(
+        make_event("你好", parts=[At(qq="300", name="Airi"), Plain("你好")])
+    )
+    assert harness.requests[-1] is mention
+    assert not mention.is_stopped()
+    assert mention.message_str == ("@Airi 你好" if allowed else "你好")
+    assert bool(mention.get_extra(BOT_MENTION_KEY)) is allowed
+    assert bool(plugin.controller.groups) is allowed
+    assert bool(plugin.session_groups) is allowed
+    for event in (bot, keyword, mention):
+        assert (event.get_extra(RECORD_KEY) is not None) is allowed
+        assert plugin.admitted(event) is allowed
+    harness.plugin.client._send.assert_not_called()
+
+
+@pytest.mark.parametrize("harness", [{"group_whitelist": ["999"]}], indirect=True)
+async def test_group_whitelist_cannot_be_bypassed_by_activated_handlers(harness):
+    event = make_event("你好", parts=[At(qq="300", name="Airi"), Plain("你好")])
+    event.set_extra("activated_handlers", [harness.adapter])
+    assert not harness.plugin.admitted(event)
+    await harness.plugin.observe(event)
+    await harness.plugin.collect_message(event)
+    await harness.plugin.observe_request(event, ProviderRequest())
+    assert event.message_str == "你好"
+    assert event.get_extra(RECORD_KEY) is None
+    assert not event.is_at_or_wake_command
+    assert not harness.plugin.controller.groups
+    assert not harness.plugin.session_groups
+
+
+@pytest.mark.parametrize(
+    "harness",
+    [{"group_whitelist": ["100"], "semantic": {"jev_api_key": "test"}}],
+    indirect=True,
+)
+async def test_group_whitelist_isolates_semantic_requests_and_bot_history(harness):
+    harness.plugin.client._send = AsyncMock(
+        return_value={"answers": {"q0": {"type": "noul", "noul": 0.99}}}
+    )
+    for group_id in ("100", "999"):
+        await harness.run(
+            make_event(
+                "机器人发言", sender="300", group=group_id, post_type="message_sent"
+            )
+        )
+        await harness.bot.send_group_msg(
+            group_id=int(group_id), message="机器人主动发言"
+        )
+    allowed = await harness.run(make_event("那你更推荐哪个？"))
+    excluded = await harness.run(make_event("那你更推荐哪个？", group="999"))
+    group = harness.plugin.controller.groups[KEY]
+    assert set(harness.plugin.controller.groups) == {KEY}
+    assert any(m.text == "机器人主动发言" for m in group.history.values())
+    assert excluded.get_extra(RECORD_KEY) is None
+    assert set(group.pending) == {allowed.message_obj.message_id}
+
+    harness.clock.now = 110
+    group.changed.set()
+    await eventually(lambda: bool(harness.requests))
+    await harness.settle()
+    harness.plugin.client._send.assert_awaited_once()
+    candidates = harness.plugin.client._send.call_args.args[0]["state"]["candidates"]
+    assert [m["message_id"] for m in candidates] == [allowed.message_obj.message_id]
+    assert len(harness.requests) == 1
+    assert harness.requests[0].get_group_id() == "100"
+    assert excluded.unified_msg_origin not in harness.plugin.session_groups
+
+
+@pytest.mark.parametrize(
     "parts",
     [
         None,
@@ -606,7 +714,9 @@ async def test_admission_checks_run_before_caching(harness, monkeypatch, gate):
     assert not harness.plugin.controller.groups
 
 
-@pytest.mark.parametrize("change", ["reset", "conversation", "disabled", "covered"])
+@pytest.mark.parametrize(
+    "change", ["reset", "conversation", "disabled", "covered", "plugin_whitelist"]
+)
 @pytest.mark.usefixtures("awake_group")
 async def test_queued_wake_cannot_survive_invalidated_state(
     harness, monkeypatch, change
@@ -628,6 +738,12 @@ async def test_queued_wake_cannot_survive_invalidated_state(
             SessionPluginManager,
             "is_plugin_enabled_for_session",
             AsyncMock(return_value=False),
+        )
+    elif change == "plugin_whitelist":
+        monkeypatch.setattr(
+            harness.plugin,
+            "settings",
+            replace(harness.plugin.settings, group_whitelist=("999",)),
         )
     else:
         harness.plugin.controller.covered(KEY, {record.id})
@@ -875,7 +991,14 @@ async def test_real_qq_debouncer_accepts_explicit_but_not_semantic_wakes(harness
 
 @pytest.mark.parametrize(
     "unsupported",
-    ["remote", "no_injection", "disabled", "session_disabled", "whitelist"],
+    [
+        "remote",
+        "no_injection",
+        "disabled",
+        "session_disabled",
+        "whitelist",
+        "plugin_whitelist",
+    ],
 )
 @pytest.mark.usefixtures("awake_group")
 async def test_semantic_prerequisites_checked_before_network(
@@ -894,6 +1017,12 @@ async def test_semantic_prerequisites_checked_before_network(
     elif unsupported == "whitelist":
         harness.config["platform_settings"]["enable_id_white_list"] = True
         harness.config["platform_settings"]["id_whitelist"] = ["999"]
+    elif unsupported == "plugin_whitelist":
+        monkeypatch.setattr(
+            harness.plugin,
+            "settings",
+            replace(harness.plugin.settings, group_whitelist=("999",)),
+        )
     else:
         monkeypatch.setattr(
             SessionPluginManager,
@@ -1190,6 +1319,8 @@ async def test_disabled_semantics_blocks_queued_reply_before_provider(
 @pytest.mark.parametrize(
     "harness",
     [
+        {"group_whitelist": "100"},
+        {"group_whitelist": [""]},
         {"preserve_bot_mention": "false"},
         {"semantic": {"jev_threshold": 0}},
         {"semantic": {"jev_threshold": "0.75"}},

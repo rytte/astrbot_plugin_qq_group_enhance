@@ -1,4 +1,10 @@
 {
+  "group_whitelist": {
+    "type": "list",
+    "description": "服务群聊白名单",
+    "default": [],
+    "hint": "填写 QQ 群号，每项一个群号；空列表表示对所有群聊生效。非空时仅在所列群聊启用本插件全部功能。保存并重载生效。"
+  },
   "preserve_bot_mention": {
     "type": "bool",
     "description": "保留机器人 @昵称",

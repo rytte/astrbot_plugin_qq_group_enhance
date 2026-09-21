@@ -38,9 +38,8 @@ class GroupWakeFilter(filter.CustomFilter):
         raw = getattr(event.message_obj, "raw_message", None)
         return bool(
             plugin
-            and plugin.active
             and event.get_platform_name() == "aiocqhttp"
-            and event.get_group_id()
+            and plugin.serves_group(event.get_group_id())
             and event.get_sender_id()
             and isinstance(raw, Mapping)
             and raw.get("post_type") in ("message", "message_sent")
@@ -81,6 +80,16 @@ class QQGroupEnhancePlugin(Star):
     @property
     def semantic_enabled(self) -> bool:
         return self.active and self.settings.enabled and bool(self.settings.jev_api_key)
+
+    def serves_group(self, group_id: str) -> bool:
+        return bool(
+            self.active
+            and group_id
+            and (
+                not self.settings.group_whitelist
+                or str(group_id) in self.settings.group_whitelist
+            )
+        )
 
     async def initialize(self) -> None:
         if self.config_error is not None:
@@ -144,7 +153,7 @@ class QQGroupEnhancePlugin(Star):
             self.active
             and not event.is_stopped()
             and event.get_platform_name() == "aiocqhttp"
-            and event.get_group_id()
+            and self.serves_group(event.get_group_id())
             and (
                 event.get_extra(REPLY_KEY) is not None
                 or any(
@@ -160,7 +169,7 @@ class QQGroupEnhancePlugin(Star):
         return str(event.get_platform_id()), str(event.get_group_id())
 
     def explicit(self, event: AstrMessageEvent) -> bool:
-        if not self.active:
+        if not self.serves_group(event.get_group_id()):
             return False
         if str(event.get_sender_id()) == str(event.get_self_id()):
             return False
@@ -345,6 +354,7 @@ class QQGroupEnhancePlugin(Star):
 
         if (
             not self.semantic_enabled
+            or not self.serves_group(event.get_group_id())
             or event.is_stopped()
             or source.event.is_stopped()
             or source.event.call_llm

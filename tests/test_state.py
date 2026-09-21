@@ -52,6 +52,8 @@ def test_retired_configuration_is_rejected(field):
         {"semantic": {"jev_retries": -1}},
         {"semantic": {"jev_model": "jev-latest"}},
         {"unknown": 1},
+        {"semantic": {"group_whitelist": ["100"]}},
+        {"keyword_wake": {"group_whitelist": ["100"]}},
         {"preserve_bot_mention": "false"},
         {"preserve_bot_mention": 0},
         {"preserve_bot_mention": None},
@@ -79,6 +81,7 @@ def test_invalid_configuration_is_rejected(config):
 
 def test_configuration_defaults_and_secret():
     settings = Settings.from_mapping({"semantic": {"jev_api_key": "secret-value"}})
+    assert settings.group_whitelist == ()
     assert settings.keywords == ()
     assert settings.keyword_ignore_case is True
     assert settings.preserve_bot_mention is True
@@ -95,6 +98,25 @@ def test_configuration_defaults_and_secret():
     assert Settings.from_mapping({}).jev_api_key == ""
     assert settings.jev_api_url == "https://api.typesafe.ai/v1/systemone"
     assert not Settings.from_mapping({"semantic": {"enabled": False}}).enabled
+
+
+@pytest.mark.parametrize(
+    "whitelist",
+    [None, "100", 100, {}, [100], [True], [None], [""], [" "], ["abc"], ["0"], ["-1"]],
+)
+def test_invalid_group_whitelist_is_rejected(whitelist):
+    with pytest.raises(ValueError, match="group_whitelist"):
+        Settings.from_mapping({"group_whitelist": whitelist})
+
+
+def test_group_whitelist_normalizes_entries_without_changing_config():
+    whitelist = [" 100 ", "200", "100"]
+    assert Settings.from_mapping({"group_whitelist": whitelist}).group_whitelist == (
+        "100",
+        "200",
+    )
+    assert whitelist == [" 100 ", "200", "100"]
+    assert Settings.from_mapping({"group_whitelist": []}).group_whitelist == ()
 
 
 @pytest.mark.parametrize(
@@ -138,7 +160,10 @@ def test_jev_request_url_preserves_custom_path_and_query(url):
 
 @pytest.mark.parametrize(
     "field",
-    sorted(Settings.__dataclass_fields__.keys() - {"preserve_bot_mention"}),
+    sorted(
+        Settings.__dataclass_fields__.keys()
+        - {"group_whitelist", "preserve_bot_mention"}
+    ),
 )
 def test_flat_configuration_requires_explicit_move(field):
     config = {field: getattr(Settings(), field), "semantic": {"enabled": False}}
@@ -170,7 +195,15 @@ def test_grouped_configuration_round_trip_and_visibility(tmp_path):
             encoding="utf-8"
         )
     )
-    assert list(schema) == ["preserve_bot_mention", "keyword_wake", "semantic"]
+    assert list(schema) == [
+        "group_whitelist",
+        "preserve_bot_mention",
+        "keyword_wake",
+        "semantic",
+    ]
+    assert schema["group_whitelist"]["type"] == "list"
+    assert schema["group_whitelist"]["default"] == []
+    assert "condition" not in schema["group_whitelist"]
     assert schema["preserve_bot_mention"]["type"] == "bool"
     assert schema["preserve_bot_mention"]["default"] is True
     assert "condition" not in schema["preserve_bot_mention"]
@@ -191,6 +224,7 @@ def test_grouped_configuration_round_trip_and_visibility(tmp_path):
     path = str(tmp_path / "plugin.json")
     config = AstrBotConfig(path, schema=schema)
     assert Settings.from_mapping(config) == Settings()
+    config["group_whitelist"] = ["100", "200"]
     config["preserve_bot_mention"] = False
     config["keyword_wake"]["keywords"] = ["test"]
     config["keyword_wake"]["keyword_ignore_case"] = False
@@ -206,6 +240,7 @@ def test_grouped_configuration_round_trip_and_visibility(tmp_path):
     settings = Settings.from_mapping(reloaded)
     assert settings == replace(
         Settings(),
+        group_whitelist=("100", "200"),
         keywords=("test",),
         keyword_ignore_case=False,
         preserve_bot_mention=False,

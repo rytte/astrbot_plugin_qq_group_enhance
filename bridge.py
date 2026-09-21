@@ -166,7 +166,7 @@ class RuntimeObserver:
 
             event = kwargs.get("event") or args[-1]
             if (
-                self.plugin.active
+                self.plugin.serves_group(event.get_group_id())
                 and self.plugin.settings.preserve_bot_mention
                 and event.get_extra(BOT_MENTION_KEY)
             ):
@@ -516,7 +516,7 @@ class RuntimeObserver:
                         delivery.failures += 1
                     raise
                 with self.guard():
-                    if is_group_send and group_id and not self.plugin.closed:
+                    if is_group_send and self.plugin.serves_group(group_id):
                         if related:
                             delivery.successes += 1
                         key = (platform_id, group_id)

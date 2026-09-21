@@ -307,7 +307,9 @@ async def test_real_async_http_transport_custom_url_headers_and_reuse(path):
 
 async def test_result_summary_reaches_webui_with_message_mapping(webui_logs):
     active = {"101", "102"}
-    client = JevClient(replace(Settings(), jev_api_key="test-secret"))
+    client = JevClient(
+        replace(Settings(), jev_api_key="test-secret", jev_threshold=0.75)
+    )
 
     async def send(payload):
         active.remove("101")
