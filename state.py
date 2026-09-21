@@ -30,6 +30,7 @@ class Settings:
     enabled: bool = True
     keywords: tuple[str, ...] = ()
     keyword_ignore_case: bool = True
+    preserve_bot_mention: bool = True
     awake_window_seconds: float = 180
     debounce_seconds: float = 3
     max_wait_seconds: float = 6
@@ -38,7 +39,7 @@ class Settings:
     jev_api_key: str = field(default="", repr=False)
     jev_api_url: str = "https://api.typesafe.ai/v1/systemone"
     jev_model: str = "jev-1.13.0"
-    jev_threshold: float = 0.75
+    jev_threshold: float = 0.7
     jev_timeout_seconds: float = 10
     jev_retries: int = 1
 
@@ -70,7 +71,8 @@ class Settings:
         if retired:
             raise ValueError("请删除废弃配置：" + ", ".join(sorted(retired)))
         direct_fields = {"keywords", "keyword_ignore_case"}
-        semantic_fields = cls.__dataclass_fields__.keys() - direct_fields
+        root_fields = {"preserve_bot_mention"}
+        semantic_fields = cls.__dataclass_fields__.keys() - direct_fields - root_fields
         for name, fields in (
             ("keyword_wake", direct_fields),
             ("semantic", semantic_fields),
@@ -80,17 +82,21 @@ class Settings:
                 raise ValueError(
                     f"请将以下字段移入 {name} 配置分组：" + ", ".join(sorted(misplaced))
                 )
-        unknown = set(config) - {"keyword_wake", "semantic"}
+        unknown = set(config) - {"keyword_wake", "semantic"} - root_fields
         unknown.update(f"keyword_wake.{k}" for k in set(keyword_wake) - direct_fields)
         unknown.update(f"semantic.{k}" for k in set(semantic) - semantic_fields)
         if unknown:
             raise ValueError("未知配置字段：" + ", ".join(sorted(unknown)))
         defaults = cls()
-        supplied = {**keyword_wake, **semantic}
+        supplied = {
+            **{k: config[k] for k in root_fields if k in config},
+            **keyword_wake,
+            **semantic,
+        }
         values = {
             k: supplied.get(k, getattr(defaults, k)) for k in cls.__dataclass_fields__
         }
-        for name in ("enabled", "keyword_ignore_case"):
+        for name in ("enabled", "keyword_ignore_case", "preserve_bot_mention"):
             if type(values[name]) is not bool:
                 raise ValueError(f"{name} 必须为布尔值")
         for name in (

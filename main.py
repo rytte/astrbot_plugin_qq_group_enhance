@@ -24,6 +24,7 @@ from .state import ChatMessage, GroupKey, GroupState, Settings, WakeController
 RECORD_KEY = "_qq_group_jev_record"
 CID_KEY = "_qq_group_jev_conversation"
 RESPONSE_KEY = "_qq_group_jev_response"
+BOT_MENTION_KEY = "_qq_group_jev_bot_mention_preserved"
 PLUGIN_NAME = "astrbot_plugin_qq_group_enhance"
 
 
@@ -174,10 +175,49 @@ class QQGroupEnhancePlugin(Star):
             for p in parts
         )
 
+    @staticmethod
+    def _preserve_bot_mention(event: AstrMessageEvent) -> None:
+        """Restore the bot mention text without changing the message chain."""
+        if event.get_extra(BOT_MENTION_KEY) or str(event.get_sender_id()) == str(
+            event.get_self_id()
+        ):
+            return
+        parts = event.get_messages()
+        mention = next(
+            (
+                part
+                for part in parts
+                if isinstance(part, At) and str(part.qq) == str(event.get_self_id())
+            ),
+            None,
+        )
+        if mention is None:
+            return
+        event.set_extra(BOT_MENTION_KEY, True)
+        current = str(event.message_str or "")
+        nickname = str(getattr(mention, "name", "") or "").strip()
+        if not nickname or nickname == str(event.get_self_id()):
+            nickname = "机器人"
+        prefix = f"@{nickname}"
+        visible = current.lstrip()
+        if visible == prefix or (
+            visible.startswith(prefix)
+            and visible[len(prefix) : len(prefix) + 1].isspace()
+        ):
+            return
+        text = current.strip()
+        restored = prefix if not text else f"{prefix} {text}"
+        event.message_str = restored
+        message_obj = getattr(event, "message_obj", None)
+        if message_obj is not None:
+            message_obj.message_str = restored
+
     async def observe(self, event: AstrMessageEvent) -> None:
         """Register arrival and wake state before asynchronous media processing."""
         if not self.admitted(event):
             return
+        if self.settings.preserve_bot_mention:
+            self._preserve_bot_mention(event)
         key = self.key(event)
         self.session_groups[event.unified_msg_origin] = key
         self.observer.watch_bot(event)

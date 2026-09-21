@@ -1,4 +1,10 @@
 {
+  "preserve_bot_mention": {
+    "type": "bool",
+    "description": "保留机器人 @昵称",
+    "default": true,
+    "hint": "保留 @昵称，仅 @也直接回复；关闭后恢复 AstrBot 原有处理。保存并重载生效。"
+  },
   "keyword_wake": {
     "type": "object",
     "description": "关键词唤醒",
@@ -108,7 +114,7 @@
       "jev_threshold": {
         "type": "float",
         "description": "逐条语义判断通过阈值",
-        "default": 0.75,
+        "default": 0.7,
         "condition": {
           "enabled": true
         },

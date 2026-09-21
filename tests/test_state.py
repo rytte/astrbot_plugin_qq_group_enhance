@@ -52,6 +52,11 @@ def test_retired_configuration_is_rejected(field):
         {"semantic": {"jev_retries": -1}},
         {"semantic": {"jev_model": "jev-latest"}},
         {"unknown": 1},
+        {"preserve_bot_mention": "false"},
+        {"preserve_bot_mention": 0},
+        {"preserve_bot_mention": None},
+        {"semantic": {"preserve_bot_mention": False}},
+        {"keyword_wake": {"preserve_bot_mention": False}},
         {"keyword_wake": {"keywords": [""]}},
         {"keyword_wake": {"keyword_ignore_case": "true"}},
         {"keyword_wake": None},
@@ -76,7 +81,8 @@ def test_configuration_defaults_and_secret():
     settings = Settings.from_mapping({"semantic": {"jev_api_key": "secret-value"}})
     assert settings.keywords == ()
     assert settings.keyword_ignore_case is True
-    assert settings.jev_threshold == 0.75
+    assert settings.preserve_bot_mention is True
+    assert settings.jev_threshold == 0.7
     assert (settings.history_messages, settings.awake_window_seconds) == (30, 180)
     assert (settings.debounce_seconds, settings.max_wait_seconds) == (3, 6)
     assert settings.max_messages_after_bot == 5
@@ -132,7 +138,7 @@ def test_jev_request_url_preserves_custom_path_and_query(url):
 
 @pytest.mark.parametrize(
     "field",
-    sorted(Settings.__dataclass_fields__),
+    sorted(Settings.__dataclass_fields__.keys() - {"preserve_bot_mention"}),
 )
 def test_flat_configuration_requires_explicit_move(field):
     config = {field: getattr(Settings(), field), "semantic": {"enabled": False}}
@@ -164,7 +170,10 @@ def test_grouped_configuration_round_trip_and_visibility(tmp_path):
             encoding="utf-8"
         )
     )
-    assert list(schema) == ["keyword_wake", "semantic"]
+    assert list(schema) == ["preserve_bot_mention", "keyword_wake", "semantic"]
+    assert schema["preserve_bot_mention"]["type"] == "bool"
+    assert schema["preserve_bot_mention"]["default"] is True
+    assert "condition" not in schema["preserve_bot_mention"]
     assert schema["keyword_wake"]["type"] == "object"
     keyword_items = schema["keyword_wake"]["items"]
     assert list(keyword_items) == ["keywords", "keyword_ignore_case"]
@@ -182,6 +191,7 @@ def test_grouped_configuration_round_trip_and_visibility(tmp_path):
     path = str(tmp_path / "plugin.json")
     config = AstrBotConfig(path, schema=schema)
     assert Settings.from_mapping(config) == Settings()
+    config["preserve_bot_mention"] = False
     config["keyword_wake"]["keywords"] = ["test"]
     config["keyword_wake"]["keyword_ignore_case"] = False
     config["semantic"].update(
@@ -198,6 +208,7 @@ def test_grouped_configuration_round_trip_and_visibility(tmp_path):
         Settings(),
         keywords=("test",),
         keyword_ignore_case=False,
+        preserve_bot_mention=False,
         enabled=False,
         jev_api_key="test-secret",
         jev_api_url="https://proxy.example.com/custom/jev",

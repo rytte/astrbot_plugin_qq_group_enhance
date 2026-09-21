@@ -129,6 +129,8 @@ class RuntimeObserver:
         self.patch(
             AstrMessageEvent, "cleanup_temporary_local_files", self._cleanup_media
         )
+        if self.plugin.settings.preserve_bot_mention:
+            self._install_empty_mention()
         self.patch(internal, "build_main_agent", self._build_agent)
         self.patch(GroupChatContext, "handle_message", self._group_record)
         self.patch(GroupChatContext, "on_req_llm", self._group_injection)
@@ -139,6 +141,40 @@ class RuntimeObserver:
         self.patch(AiocqhttpMessageEvent, "send", self._event_send)
         self.patch(ActiveEventRegistry, "stop_all", self._stop_all)
         self.installed = True
+
+    def _install_empty_mention(self):
+        from astrbot.builtin_stars.astrbot.main import Main
+        from astrbot.core.star.star_handler import star_handlers_registry
+
+        handlers = [
+            handler
+            for handler in star_handlers_registry.get_handlers_by_module_name(
+                Main.__module__
+            )
+            if handler.handler_name == "handle_empty_mention"
+        ]
+        if len(handlers) != 1 or not callable(handlers[0].handler):
+            raise RuntimeError(
+                "Unsupported AstrBot integration: missing registered "
+                "Main.handle_empty_mention"
+            )
+        self.patch(handlers[0], "handler", self._empty_mention)
+
+    def _empty_mention(self, original):
+        async def wrapped(*args, **kwargs):
+            from .main import BOT_MENTION_KEY
+
+            event = kwargs.get("event") or args[-1]
+            if (
+                self.plugin.active
+                and self.plugin.settings.preserve_bot_mention
+                and event.get_extra(BOT_MENTION_KEY)
+            ):
+                return
+            async for result in original(*args, **kwargs):
+                yield result
+
+        return wrapped
 
     def _cleanup_media(self, original):
         @wraps(original)

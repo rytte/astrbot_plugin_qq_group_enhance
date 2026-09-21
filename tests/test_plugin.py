@@ -3,6 +3,7 @@ import itertools
 from collections import defaultdict
 from copy import copy, deepcopy
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -45,6 +46,7 @@ from astrbot.core.utils.active_event_registry import (
 from astrbot_plugin_qq_group_enhance import main
 from astrbot_plugin_qq_group_enhance.bridge import ACTIVE_RUN, fingerprint
 from astrbot_plugin_qq_group_enhance.main import (
+    BOT_MENTION_KEY,
     RECORD_KEY,
     GroupWakeFilter,
     QQGroupEnhancePlugin,
@@ -324,10 +326,145 @@ async def test_explicit_wake_preserves_text_and_never_calls_jev(harness, parts):
     event = make_event("你好小爱", parts=parts)
     await harness.run(event)
     assert harness.requests == [event]
-    assert event.message_str == "你好小爱"
+    if parts and isinstance(parts[0], At) and str(parts[0].qq) == "300":
+        assert event.message_str == "@机器人 你好小爱"
+        assert event.message_obj.message_str == event.message_str
+        assert event.get_extra(BOT_MENTION_KEY) is True
+    else:
+        assert event.message_str == "你好小爱"
     assert harness.plugin.controller.groups[KEY].awake_until == 280
     assert event.get_extra(RECORD_KEY).status == "covered"
     harness.plugin.client._send.assert_not_called()
+
+
+async def test_bot_mention_is_preserved_without_rewriting_message_chain(harness):
+    parts = [At(qq="300", name="Airi"), Plain("你在吗")]
+    event = make_event("你在吗", parts=parts)
+
+    await harness.run(event)
+
+    assert harness.requests == [event]
+    assert event.message_str == "@Airi 你在吗"
+    assert event.message_obj.message_str == "@Airi 你在吗"
+    assert event.get_extra(BOT_MENTION_KEY) is True
+    assert event.get_messages() == parts
+    assert not any("@" in getattr(part, "text", "") for part in parts)
+
+
+async def test_only_bot_mention_enters_normal_reply_without_waiting(harness):
+    event = make_event("", parts=[At(qq="300", name="Airi")])
+
+    await harness.run(event)
+
+    assert harness.requests == [event]
+    assert event.message_str == "@Airi"
+    assert event.message_obj.message_str == "@Airi"
+    assert not event.is_stopped()
+    assert event.get_extra(BOT_MENTION_KEY) is True
+
+
+async def test_empty_mention_wrapper_skips_only_preserved_bot_mentions(harness):
+    calls = []
+
+    async def original(owner, event):
+        assert owner is harness.plugin
+        calls.append(event)
+        yield "delegated"
+
+    wrapped = harness.plugin.observer._empty_mention(partial(original, harness.plugin))
+    marked = make_event("", parts=[At(qq="300", name="Airi")])
+    marked.set_extra(BOT_MENTION_KEY, True)
+    ordinary = make_event("普通消息")
+
+    assert [item async for item in wrapped(marked)] == []
+    assert [item async for item in wrapped(ordinary)] == ["delegated"]
+    assert calls == [ordinary]
+
+
+@pytest.mark.parametrize(
+    "harness",
+    [
+        {"preserve_bot_mention": preserve, "semantic": {"enabled": semantic}}
+        for preserve in (True, False)
+        for semantic in (True, False)
+    ],
+    indirect=True,
+)
+async def test_bot_mention_switch_is_independent_of_jev(harness):
+    preserve = harness.plugin.settings.preserve_bot_mention
+    parts = [At(qq="300", name="Airi"), Plain("你在吗")]
+    event = await harness.run(make_event("你在吗", parts=parts))
+    assert event.message_str == ("@Airi 你在吗" if preserve else "你在吗")
+    assert event.message_obj.message_str == event.message_str
+    assert bool(event.get_extra(BOT_MENTION_KEY)) is preserve
+    assert event.get_messages() == parts
+    assert event.is_at_or_wake_command
+    assert harness.requests == [event]
+    harness.plugin.client._send.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "harness",
+    [{"preserve_bot_mention": True}, {"preserve_bot_mention": False}],
+    indirect=True,
+)
+async def test_bot_mention_switch_controls_registered_empty_mention(
+    harness, monkeypatch
+):
+    from astrbot.builtin_stars.astrbot import main as builtin
+
+    # Use the real handler, ending its waiter immediately to avoid a 60s test.
+    waiter = AsyncMock(side_effect=TimeoutError)
+    monkeypatch.setattr(builtin, "session_waiter", lambda timeout: lambda fn: waiter)
+    harness.config["platform_settings"].update(
+        empty_mention_waiting=True, empty_mention_waiting_need_reply=True
+    )
+    harness.context.conversation_manager.get_conversation = AsyncMock(return_value=None)
+    handler = next(
+        h
+        for h in star_handlers_registry.get_handlers_by_module_name(
+            builtin.Main.__module__
+        )
+        if h.handler_name == "handle_empty_mention"
+    )
+    event = make_event("", parts=[At(qq="300", name="Airi")])
+    event.set_extra("activated_handlers", [harness.adapter])
+    await harness.plugin.observe(event)
+    owner = SimpleNamespace(context=harness.context)
+    results = [result async for result in handler.handler(owner, event)]
+    if harness.plugin.settings.preserve_bot_mention:
+        assert event.message_str == "@Airi"
+        assert results == []
+        assert not event.is_stopped()
+        waiter.assert_not_called()
+    else:
+        assert event.message_str == ""
+        assert event.message_obj.message_str == ""
+        assert event.get_extra(BOT_MENTION_KEY) is None
+        assert len(results) == 1  # AstrBot's preset request is restored.
+        assert event.is_stopped()
+        waiter.assert_awaited_once_with(event)
+        assert all(
+            target is not handler for target, *_ in harness.plugin.observer.patches
+        )
+
+
+async def test_bot_mention_does_not_rewrite_other_mentions(harness):
+    parts = [
+        At(qq="300", name="Airi"),
+        Plain("你怎么看"),
+        At(qq="123", name="小明"),
+    ]
+    event = make_event("你怎么看 @小明", parts=parts)
+
+    await harness.run(event)
+
+    assert harness.requests == [event]
+    assert event.message_str == "@Airi 你怎么看 @小明"
+    assert event.message_obj.message_str == event.message_str
+    assert event.get_messages() == parts
+    assert "@小明" in event.message_str
+    assert "(123)" not in event.message_str
 
 
 @pytest.mark.parametrize(
@@ -1053,6 +1190,7 @@ async def test_disabled_semantics_blocks_queued_reply_before_provider(
 @pytest.mark.parametrize(
     "harness",
     [
+        {"preserve_bot_mention": "false"},
         {"semantic": {"jev_threshold": 0}},
         {"semantic": {"jev_threshold": "0.75"}},
         {"semantic": {"jev_threshold": 2}},
