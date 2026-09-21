@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from astrbot.api.message_components import At, Plain, Reply
+from astrbot.api.message_components import At, Face, Plain, Record, Reply
 from astrbot.builtin_stars.astrbot.group_chat_context import GroupChatContext
 from astrbot.core.agent.message import Message
 from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
@@ -386,7 +386,7 @@ async def test_observer_and_awake_group_do_not_automatically_wake(harness):
     await harness.run(make_event("仍然需要语义判断"))
     assert len(harness.requests) == 1
     assert group.awake_until == 280
-    assert group.deadline == 115
+    assert group.deadline == 113
 
 
 @pytest.mark.usefixtures("awake_group")
@@ -1056,7 +1056,8 @@ async def test_disabled_semantics_blocks_queued_reply_before_provider(
         {"semantic": {"jev_threshold": 0}},
         {"semantic": {"jev_threshold": "0.75"}},
         {"semantic": {"jev_threshold": 2}},
-        {"semantic": {"awake_observe_seconds": 0}},
+        {"semantic": {"debounce_seconds": 0}},
+        {"semantic": {"awake_observe_seconds": 5}},
         {"semantic": {"max_messages_after_bot": 0}},
         {"asleep_observe_seconds": 10},
         {"semantic": {"history_messages": 0}},
@@ -1217,6 +1218,179 @@ def add_inbound(harness, handler, priority=10):
     registered.handler = handler
     registered.extras_configs = {"priority": priority}
     harness.handlers.append(registered)
+
+
+@pytest.fixture
+def qq_enrichment(harness):
+    from astrbot_plugin_qq_enhance.main import QQEnhancePlugin
+
+    qq = object.__new__(QQEnhancePlugin)
+    qq.config = {
+        "platform": {"platform_id": ""},
+        "inbound": {
+            "component_spoof_protection": {"enabled": False},
+            "semanticize_components": True,
+            "enhance_voice_messages": True,
+            "respond_to_red_packet": False,
+            "respond_to_poke": False,
+            "max_semantic_chars": 2000,
+        },
+        "limits": {"max_components": 50},
+    }
+    qq.runtime = SimpleNamespace(
+        verify_platform=AsyncMock(),
+        call_action=AsyncMock(return_value={"text": "转写结果"}),
+    )
+    add_inbound(harness, qq.enrich_inbound_qq_components, priority=0)
+    return qq
+
+
+@pytest.mark.parametrize(
+    "harness",
+    [{"semantic": {"jev_api_key": "test"}}, {"semantic": {"enabled": False}}],
+    indirect=True,
+)
+@pytest.mark.usefixtures("awake_group")
+async def test_collects_real_qq_enrichment_before_debounce_without_outline_overwrite(
+    harness, qq_enrichment
+):
+    event = make_event("你怎么看", parts=[Plain("你怎么看"), Face(id=14)])
+    event.message_obj.raw_message["message"] = [
+        {"type": "face", "data": {"id": "14"}},
+        {"type": "share", "data": {"title": "新闻标题", "url": "https://example.com"}},
+    ]
+    seen = []
+
+    async def debounce(event):
+        record = event.get_extra(RECORD_KEY)
+        seen.append((record.ready, record.text))
+
+    add_inbound(harness, debounce, priority=-20000)
+    await harness.run(event)
+    record = event.get_extra(RECORD_KEY)
+    assert "QQ表情：微笑" in record.text
+    assert "QQ链接分享：新闻标题" in record.text
+    assert record.text.count("你怎么看") == 1
+    assert "QQ表情：微笑" not in event.get_message_outline()
+    assert seen == [(True, event.message_str)]
+    harness.plugin.refresh(event)
+    assert record.text == event.message_str
+    if harness.plugin.semantic_enabled:
+        judge = AsyncMock(return_value={})
+        harness.plugin.controller.judge = judge
+        harness.clock.now = 103
+        group = harness.plugin.controller.groups[KEY]
+        group.changed.set()
+        await eventually(lambda: group.worker is None)
+        assert judge.call_args.args[2][0]["text"] == event.message_str
+    else:
+        group = harness.plugin.controller.groups[KEY]
+        assert group.history[record.id] is record
+        assert not group.pending and group.worker is None
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_collects_real_qq_referenced_voice_and_mentions(
+    harness, qq_enrichment, monkeypatch
+):
+    monkeypatch.setattr(
+        Record, "convert_to_file_path", AsyncMock(side_effect=FileNotFoundError())
+    )
+    quote = Reply(id="42", sender_id="456", chain=[Record(file="voice.silk")])
+    event = make_event("说得对", parts=[quote, At(qq="456"), Plain("说得对")])
+    event.message_obj.raw_message["message"] = [
+        {"type": "reply", "data": {"id": "42"}},
+        {"type": "text", "data": {"text": "说得对"}},
+    ]
+    await harness.run(event)
+    record = event.get_extra(RECORD_KEY)
+    assert record.ready
+    assert record.mentions == ("456",)
+    assert record.reply == {
+        "message_id": "42",
+        "sender_id": "456",
+        "text": "[QQ component|QQ语音消息：转写结果]",
+    }
+    assert record.text == "说得对"
+    assert record.reply["text"] == quote.chain[0].text
+
+
+async def test_slow_qq_voice_preserves_arrival_eligibility_without_delaying_text(
+    harness, qq_enrichment, monkeypatch
+):
+    monkeypatch.setattr(
+        Record, "convert_to_file_path", AsyncMock(side_effect=FileNotFoundError())
+    )
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def transcribe(*args, **kwargs):
+        entered.set()
+        await finish.wait()
+        return {"text": "我也想问这个"}
+
+    qq_enrichment.runtime.call_action.side_effect = transcribe
+    controller = harness.plugin.controller
+    judge = AsyncMock(return_value={})
+    controller.judge = judge
+    await harness.run(make_event("机器人发言", sender="300", mid="anchor"))
+    voice = make_event("", parts=[Record(file="voice.silk")], mid="101")
+    voice.message_obj.raw_message.update(
+        message_id=101, message=[{"type": "record", "data": {"file": "voice.silk"}}]
+    )
+    task = asyncio.create_task(harness.run(voice))
+    try:
+        await eventually(entered.is_set)
+        group = controller.groups[KEY]
+        record = voice.get_extra(RECORD_KEY)
+        assert not record.ready and record.text == ""
+        harness.clock.now = 101
+        events = [await harness.run(make_event(f"消息{i}")) for i in range(5)]
+        assert events[-1].get_extra(RECORD_KEY).status == "background"
+        harness.clock.now = 105
+        group.changed.set()
+        await eventually(lambda: judge.await_count == 1 and not group.inflight)
+        assert [m["message_id"] for m in judge.call_args.args[2]] == [
+            e.message_obj.message_id for e in events[:4]
+        ]
+        assert list(group.pending) == ["101"]
+        assert not task.done()
+        finish.set()
+        await task
+        await eventually(lambda: group.worker is None)
+        assert judge.await_count == 2
+        assert judge.call_args.args[2][0]["text"] == (
+            "[QQ component|QQ语音消息：我也想问这个]"
+        )
+        assert record.sequence == 2 and record.arrived_at == 100
+        assert not controller.is_awake(group)
+    finally:
+        finish.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.usefixtures("awake_group")
+async def test_semantic_reply_does_not_wait_for_a_new_unprepared_input(harness):
+    first = await harness.run(make_event("已完成语义化的追问"))
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def enrich(event):
+        entered.set()
+        await finish.wait()
+        event.message_str = "稍后完成的增强文本"
+
+    add_inbound(harness, enrich, priority=0)
+    later = make_event("仍在处理的消息")
+    task = asyncio.create_task(harness.run(later))
+    try:
+        await eventually(entered.is_set)
+        request = await asyncio.wait_for(schedule_reply(harness, first), 1)
+        await harness.settle()
+        assert request.source is first.get_extra(RECORD_KEY)
+        assert not task.done()
+        assert later.get_extra(RECORD_KEY).status == "pending"
+    finally:
+        finish.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def schedule_reply(harness, event):
@@ -1599,7 +1773,7 @@ async def test_asleep_recent_bot_send_limits_candidates_and_semantic_wake(harnes
     assert group.sequence == 8
     assert list(group.pending) == [str(i) for i in range(1, 6)]
     assert events[5].get_extra(RECORD_KEY).status == "background"
-    assert group.deadline == 105
+    assert group.deadline == 103
     assert not harness.requests
 
     async def send(payload):

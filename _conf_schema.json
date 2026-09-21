@@ -65,14 +65,23 @@
         },
         "hint": "进入清醒后的持续时间；模型回复成功发送后刷新。"
       },
-      "awake_observe_seconds": {
+      "debounce_seconds": {
         "type": "float",
-        "description": "Jev 消息聚合窗口（秒）",
-        "default": 5.0,
+        "description": "Jev 防抖等待（秒）",
+        "default": 3.0,
         "condition": {
           "enabled": true
         },
-        "hint": "从首条待判消息起计时，到期后统一判断；新消息不延长窗口。须大于 0。"
+        "hint": "新的待判消息到达后重新计时，安静满此时长即判断。"
+      },
+      "max_wait_seconds": {
+        "type": "float",
+        "description": "Jev 最长聚合等待（秒）",
+        "default": 6.0,
+        "condition": {
+          "enabled": true
+        },
+        "hint": "从首条待判消息到达起计算的等待上限，不小于防抖等待；不含语义化和请求耗时。"
       },
       "max_messages_after_bot": {
         "type": "int",

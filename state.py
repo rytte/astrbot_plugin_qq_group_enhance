@@ -1,4 +1,4 @@
-"""Group-scoped, in-memory semantic wake state and independent observation windows."""
+"""Group-scoped semantic wake state and independent, bounded message debouncing."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ RETIRED = {
     "medium_max_messages",
     "count_bot_messages",
     "asleep_observe_seconds",
+    "awake_observe_seconds",
 }
 
 
@@ -30,7 +31,8 @@ class Settings:
     keywords: tuple[str, ...] = ()
     keyword_ignore_case: bool = True
     awake_window_seconds: float = 180
-    awake_observe_seconds: float = 5
+    debounce_seconds: float = 3
+    max_wait_seconds: float = 6
     max_messages_after_bot: int = 5
     history_messages: int = 30
     jev_api_key: str = field(default="", repr=False)
@@ -60,11 +62,13 @@ class Settings:
                 "（开启表示不区分大小写，关闭表示区分大小写）"
             )
         retired = RETIRED.intersection(configured_fields)
-        if retired:
+        if "awake_observe_seconds" in retired:
             raise ValueError(
-                "流量分级及非清醒全量检测已移除，请删除废弃配置："
-                + ", ".join(sorted(retired))
+                "awake_observe_seconds 已移除，请配置 semantic.debounce_seconds "
+                "和 semantic.max_wait_seconds"
             )
+        if retired:
+            raise ValueError("请删除废弃配置：" + ", ".join(sorted(retired)))
         direct_fields = {"keywords", "keyword_ignore_case"}
         semantic_fields = cls.__dataclass_fields__.keys() - direct_fields
         for name, fields in (
@@ -91,7 +95,8 @@ class Settings:
                 raise ValueError(f"{name} 必须为布尔值")
         for name in (
             "awake_window_seconds",
-            "awake_observe_seconds",
+            "debounce_seconds",
+            "max_wait_seconds",
             "jev_timeout_seconds",
             "jev_threshold",
         ):
@@ -104,6 +109,8 @@ class Settings:
                 raise ValueError(f"{name} 必须为有限正数")
         if values["jev_threshold"] > 1:
             raise ValueError("jev_threshold 必须在 (0, 1] 内")
+        if values["max_wait_seconds"] < values["debounce_seconds"]:
+            raise ValueError("max_wait_seconds 不能小于 debounce_seconds")
         for name, minimum, maximum in (
             ("max_messages_after_bot", 1, 1000),
             ("history_messages", 1, 1000),
@@ -152,6 +159,9 @@ class ChatMessage:
     text: str
     timestamp: float
     sequence: int = 0
+    arrived_at: float = 0
+    ready: bool = True
+    debounce_elapsed: bool = False
     bot: bool = False
     bot_id: str = ""
     mentions: tuple[str, ...] = ()
@@ -283,6 +293,7 @@ class WakeController:
             return False
         group = self.groups[key]
         message.sequence = sequence
+        message.arrived_at = self.clock()
         near_bot = (
             group.last_bot_sequence is not None
             and 0
@@ -295,6 +306,28 @@ class WakeController:
             self.archive(group, message, "background")
             return True
         group.pending[message.id] = message
+        self._limit_pending(key, group)
+        self._reschedule(group)
+        if group.pending and group.worker is None:
+            group.worker = asyncio.create_task(self._run(key, group))
+            self.tasks.add(group.worker)
+            group.worker.add_done_callback(self.tasks.discard)
+        return True
+
+    def prepared(self, key: GroupKey, message: ChatMessage) -> None:
+        """Publish enriched content without changing its arrival or eligibility."""
+        group = self.groups.get(key)
+        if (
+            self.closed
+            or group is None
+            or group.records().get(message.id) is not message
+        ):
+            return
+        message.ready = True
+        self._limit_pending(key, group)
+        group.changed.set()
+
+    def _limit_pending(self, key: GroupKey, group: GroupState) -> None:
         # Overload is explicit terminal failure, never a silent maxlen eviction.
         size = sum(len(m.text.encode("utf-8")) for m in group.pending.values())
         while len(group.pending) > self.MAX_PENDING or size > self.MAX_PENDING_BYTES:
@@ -306,14 +339,20 @@ class WakeController:
                 oldest.id,
                 key,
             )
-        if group.pending and group.deadline is None:
-            group.deadline = self.clock() + self.settings.awake_observe_seconds
+
+    def _reschedule(self, group: GroupState) -> None:
+        arrivals = [
+            m.arrived_at for m in group.pending.values() if not m.debounce_elapsed
+        ]
+        group.deadline = (
+            min(
+                max(arrivals) + self.settings.debounce_seconds,
+                min(arrivals) + self.settings.max_wait_seconds,
+            )
+            if arrivals
+            else None
+        )
         group.changed.set()
-        if group.pending and group.worker is None:
-            group.worker = asyncio.create_task(self._run(key, group))
-            self.tasks.add(group.worker)
-            group.worker.add_done_callback(self.tasks.discard)
-        return True
 
     def archive(self, group: GroupState, message: ChatMessage, status: str) -> None:
         group.pending.pop(message.id, None)
@@ -333,9 +372,7 @@ class WakeController:
         )
         while len(group.history) > self.settings.history_messages:
             group.history.popitem(last=False)
-        if not group.pending:
-            group.deadline = None
-        group.changed.set()
+        self._reschedule(group)
 
     def covered(self, key: GroupKey, ids: set[str]) -> None:
         group = self.groups.get(key)
@@ -357,20 +394,33 @@ class WakeController:
         try:
             while not self.closed and self.groups.get(key) is group and group.pending:
                 group.changed.clear()
-                delay = max(0, (group.deadline or self.clock()) - self.clock())
-                if delay:
+                if group.deadline is not None and group.deadline <= self.clock():
+                    # Close the arrival batch even if some media is still being
+                    # prepared. Those messages cannot expire a newer batch.
+                    for message in group.pending.values():
+                        message.debounce_elapsed = True
+                    self._reschedule(group)
+                candidates = [
+                    m for m in group.pending.values() if m.ready and m.debounce_elapsed
+                ]
+                if not candidates:
+                    delay = (
+                        max(0, group.deadline - self.clock())
+                        if group.deadline is not None
+                        else None
+                    )
                     try:
                         await asyncio.wait_for(group.changed.wait(), delay)
-                        continue
                     except TimeoutError:
                         pass
-                candidates = list(group.pending.values())
-                group.pending.clear()
-                group.deadline = None
+                    continue
+                for message in candidates:
+                    group.pending.pop(message.id)
+                self._reschedule(group)
                 group.inflight = {m.id: m for m in candidates}
                 for message in candidates:
                     message.status = "judging"
-                history = [m.payload() for m in group.history.values()]
+                history = [m.payload() for m in group.history.values() if m.ready]
                 payloads = [m.payload() for m in candidates]
                 try:
                     results = await self.judge(

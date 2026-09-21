@@ -175,7 +175,7 @@ class QQGroupEnhancePlugin(Star):
         )
 
     async def observe(self, event: AstrMessageEvent) -> None:
-        """Record admitted inputs before media work without awaiting the window."""
+        """Register arrival and wake state before asynchronous media processing."""
         if not self.admitted(event):
             return
         key = self.key(event)
@@ -205,26 +205,15 @@ class QQGroupEnhancePlugin(Star):
         if not mid:
             logger.error("Jev cannot track a QQ message without a message ID")
             return
-        parts = event.get_messages()
-        quote = next((p for p in parts if isinstance(p, Reply)), None)
         record = ChatMessage(
             id=mid,
             sender_id=str(event.get_sender_id()),
             sender_name=event.get_sender_name() or "",
-            text=event.get_message_outline(),
+            text="",
             timestamp=float(event.message_obj.timestamp or time.time()),
+            ready=False,
             bot=bot,
             bot_id=str(event.get_self_id()),
-            mentions=tuple(str(p.qq) for p in parts if isinstance(p, At)),
-            reply=(
-                {
-                    "message_id": str(quote.id),
-                    "sender_id": str(quote.sender_id),
-                    "text": str(quote.message_str or ""),
-                }
-                if quote
-                else None
-            ),
             event=event,
             scheduler=ACTIVE_PIPELINE.get(),
             task=asyncio.current_task(),
@@ -249,19 +238,40 @@ class QQGroupEnhancePlugin(Star):
     def refresh(self, event: AstrMessageEvent) -> None:
         if not self.admitted(event):
             return
-        record = event.get_extra(RECORD_KEY)
-        if record and not event.get_extra(REPLY_KEY):
-            record.text = event.get_message_outline()
-        if (
-            self.admitted(event)
-            and event.is_at_or_wake_command
-            and (str(event.get_sender_id()) != str(event.get_self_id()))
+        if event.is_at_or_wake_command and (
+            str(event.get_sender_id()) != str(event.get_self_id())
         ):
             self.controller.awakened(self.key(event))
 
     @filter.custom_filter(GroupWakeFilter, priority=maxsize)
     async def observe_message(self, event: AstrMessageEvent) -> None:
         await self.observe(event)
+
+    @filter.custom_filter(GroupWakeFilter, priority=-10000)
+    async def collect_message(self, event: AstrMessageEvent) -> None:
+        """Capture after QQ enrichment (0), before its reply debounce (-20000)."""
+        if not self.admitted(event) or event.get_extra(REPLY_KEY):
+            return
+        record = event.get_extra(RECORD_KEY)
+        if record is None or record.event is not event or record.ready:
+            return
+        parts = event.get_messages()
+        quote = next((p for p in parts if isinstance(p, Reply)), None)
+        record.text = (
+            str(event.message_str or "").strip() or event.get_message_outline()
+        )
+        record.mentions = tuple(str(p.qq) for p in parts if isinstance(p, At))
+        record.reply = (
+            {
+                "message_id": str(quote.id),
+                "sender_id": str(quote.sender_id),
+                "text": str(quote.message_str or ""),
+            }
+            if quote
+            else None
+        )
+        self.controller.prepared(self.key(event), record)
+        self.refresh(event)
 
     @filter.custom_filter(GroupWakeFilter, priority=-maxsize)
     async def observe_later_wake(self, event: AstrMessageEvent) -> None:
@@ -377,6 +387,7 @@ class QQGroupEnhancePlugin(Star):
                 m
                 for m in group.records().values()
                 if m.event
+                and m.ready
                 and not m.bot
                 and m.event.unified_msg_origin == origin
                 and self.controller.valid(key, group, m)
