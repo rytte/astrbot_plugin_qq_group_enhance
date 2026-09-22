@@ -1,5 +1,6 @@
 import asyncio
 import itertools
+import json
 from collections import defaultdict
 from copy import copy, deepcopy
 from dataclasses import replace
@@ -469,6 +470,146 @@ async def test_only_bot_mention_enters_normal_reply_without_waiting(harness):
     assert event.message_obj.message_str == "@Airi"
     assert not event.is_stopped()
     assert event.get_extra(BOT_MENTION_KEY) is True
+
+
+@pytest.fixture
+def builtin_collector(harness):
+    """Exercise the real core collector instead of recording every component."""
+    from astrbot.builtin_stars.astrbot.main import Main
+
+    builtin = Main.__new__(Main)
+    builtin.context = harness.context
+    builtin.group_chat_context = harness.native
+    harness.context.get_registered_star = MagicMock(
+        return_value=SimpleNamespace(star_cls=builtin)
+    )
+    collector = next(h for h in harness.handlers if h.handler_name == "native_record")
+    collector.handler = builtin.on_message
+    return builtin
+
+
+@pytest.mark.usefixtures("builtin_collector")
+@pytest.mark.parametrize("text", ["", "please respond"])
+async def test_bot_mention_injects_history_through_builtin_collector(harness, text):
+    previous = await harness.run(make_event("Show me my scheduled tasks"))
+    parts = [At(qq="300", name="Rin")]
+    if text:
+        parts.append(Plain(text))
+    mention = await harness.run(make_event(text, parts=parts))
+
+    assert harness.requests == [mention]
+    assert mention.get_messages() == parts
+    payload = harness.payloads[0]["contexts"][-1].model_dump_json()
+    assert payload.count(previous.message_str) == 1
+    assert "@Rin" in payload
+    assert "[At: Rin]" not in payload
+    assert previous.get_extra(RECORD_KEY).status == "covered"
+    assert mention.get_extra(RECORD_KEY).native_record_id
+    assert not harness.native.raw_records[mention.unified_msg_origin]
+    harness.plugin.client._send.assert_not_called()
+
+
+@pytest.mark.usefixtures("builtin_collector")
+async def test_only_bot_mention_preserves_messages_arriving_during_debounce(harness):
+    previous = await harness.run(make_event("Show me my scheduled tasks"))
+    mention = make_event("", parts=[At(qq="300", name="Rin")])
+    waiting, release = asyncio.Event(), asyncio.Event()
+
+    async def debounce(event):
+        if event is mention:
+            waiting.set()
+            await release.wait()
+
+    add_inbound(harness, debounce, priority=-20000)
+    task = asyncio.create_task(harness.run(mention))
+    try:
+        async with asyncio.timeout(2):
+            await waiting.wait()
+        later = await harness.run(make_event("A later unrelated message"))
+    finally:
+        release.set()
+        await task
+
+    payload = harness.payloads[0]["contexts"][-1].model_dump_json()
+    assert previous.message_str in payload
+    assert later.message_str not in payload
+    assert any(
+        later.message_str in entry
+        for entry in harness.native.raw_records[mention.unified_msg_origin]
+    )
+
+
+@pytest.mark.usefixtures("builtin_collector")
+@pytest.mark.parametrize("gate", ["context", "mention", "group"])
+async def test_mention_context_repair_respects_feature_scope(harness, gate):
+    if gate == "context":
+        harness.config["provider_ltm_settings"]["group_icl_enable"] = False
+    elif gate == "mention":
+        harness.plugin.settings = replace(
+            harness.plugin.settings, preserve_bot_mention=False
+        )
+    else:
+        harness.plugin.settings = replace(
+            harness.plugin.settings, group_whitelist=("999",)
+        )
+
+    mention = await harness.run(make_event("", parts=[At(qq="300", name="Rin")]))
+
+    assert mention.get_extra("_group_context_record_id") is None
+    harness.context.get_registered_star.assert_not_called()
+    assert not harness.native.raw_records.get(mention.unified_msg_origin)
+
+
+@pytest.mark.usefixtures("builtin_collector")
+@pytest.mark.parametrize("text", ["", "please respond"])
+async def test_injected_group_context_is_saved_and_available_next_turn(
+    harness, tmp_path, text
+):
+    """Verify native persistence keeps injected group content across turns."""
+    from astrbot.core.conversation_mgr import ConversationManager
+    from astrbot.core.db.sqlite import SQLiteDatabase
+    from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import (
+        InternalAgentSubStage,
+    )
+
+    previous = await harness.run(make_event("Show me my scheduled tasks"))
+    parts = [At(qq="300", name="Rin")]
+    if text:
+        parts.append(Plain(text))
+    mention = await harness.run(make_event(text, parts=parts))
+    db = SQLiteDatabase(str(tmp_path / "group-context.db"))
+    try:
+        await db.initialize()
+        manager = ConversationManager(db)
+        umo = mention.unified_msg_origin
+        cid = await manager.new_conversation(umo, platform_id=mention.get_platform_id())
+        conversation = await manager.get_conversation(umo, cid)
+        stage = InternalAgentSubStage()
+        stage.conv_manager = manager
+        response = LLMResponse(role="assistant", completion_text="Here are your tasks")
+        await stage._save_to_history(
+            mention,
+            ProviderRequest(conversation=conversation),
+            response,
+            [
+                *harness.payloads[0]["contexts"],
+                Message(role="assistant", content=response.completion_text),
+            ],
+            runner_stats=None,
+        )
+
+        restored = await ConversationManager(db).get_conversation(umo, cid)
+        request = ProviderRequest(
+            prompt="What did I ask before?", contexts=json.loads(restored.history)
+        )
+        await harness.provider.text_chat(
+            contexts=[*request.contexts, await request.assemble_context()]
+        )
+        payload = json.dumps(harness.payloads[-1]["contexts"])
+        assert payload.count(previous.message_str) == 1
+        assert request.prompt in payload
+    finally:
+        await db.engine.dispose()
 
 
 async def test_empty_mention_wrapper_skips_only_preserved_bot_mentions(harness):

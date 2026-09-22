@@ -305,6 +305,30 @@ class QQGroupEnhancePlugin(Star):
         if record is None or record.event is not event or record.ready:
             return
         parts = event.get_messages()
+        if (
+            self.settings.preserve_bot_mention
+            and event.get_extra(BOT_MENTION_KEY)
+            and len(parts) == 1
+            and isinstance(parts[0], At)
+            and str(parts[0].qq) == str(event.get_self_id())
+            and not event.get_extra("_group_context_record_id")
+            and not event.get_extra("handlers_parsed_params", {})
+            and self.context.get_config(umo=event.unified_msg_origin)[
+                "provider_ltm_settings"
+            ]["group_icl_enable"]
+        ):
+            # The native collector skips At-only chains. Record the boundary before
+            # reply debounce so later arrivals remain available to their own turns.
+            builtin = self.context.get_registered_star("astrbot")
+            if (
+                builtin is None
+                or builtin.star_cls is None
+                or builtin.star_cls.group_chat_context is None
+            ):
+                raise RuntimeError(
+                    "Native group chat context is unavailable for a mention-only reply"
+                )
+            await builtin.star_cls.group_chat_context.handle_message(event)
         quote = next((p for p in parts if isinstance(p, Reply)), None)
         record.text = (
             str(event.message_str or "").strip() or event.get_message_outline()
