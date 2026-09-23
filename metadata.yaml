@@ -1,9 +1,9 @@
 name: astrbot_plugin_qq_group_enhance
 display_name: QQ 群聊增强
-desc: 基于 Jev 逐条判断群聊发言对象，支持直接唤醒、群共享清醒窗口和模型输入覆盖去重，可配合 QQ 增强防抖。
-version: 0.2.0
+desc: 用于增强 QQ机器人的群聊能力，支持关键词唤醒、JEV 语义唤醒和@优化。
+version: 0.3.0
 author: rytte
 repo: https://github.com/rytte/astrbot_plugin_qq_group_enhance
 support_platforms:
   - aiocqhttp
-astrbot_version: ">=4.27.4,<5"
+astrbot_version: ">=4.27,<5"
