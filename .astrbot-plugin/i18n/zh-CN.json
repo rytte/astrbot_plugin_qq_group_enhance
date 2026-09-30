@@ -1,0 +1,12 @@
+{
+  "pages": {
+    "laya-models": {
+      "title": "模型管理与测试",
+      "description": "下载 Laya、SemIf 模型，测试本地模型与 Jev 的唤醒和通用判断"
+    },
+    "semif-models": {
+      "title": "SemIf 模型",
+      "description": "选择和下载 SemIf 模型，或使用自定义路径"
+    }
+  }
+}

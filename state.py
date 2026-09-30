@@ -9,10 +9,14 @@ import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from astrbot.api import logger as log
+
+from .laya_models import DEFAULT_LAYA_MODEL, LAYA_MODEL_KEYS
+from .semif_models import CUSTOM_SEMIF_MODEL, SEMIF_MODEL_KEYS
 
 GroupKey = tuple[str, str]
 RETIRED = {
@@ -23,6 +27,22 @@ RETIRED = {
     "asleep_observe_seconds",
     "awake_observe_seconds",
 }
+
+
+def validate_custom_semif_model(source: str, revision: str) -> None:
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("semif_model 必须填写本地模型目录或 Hugging Face 模型 ID")
+    if not isinstance(revision, str) or not revision.strip():
+        raise ValueError("semif_revision 必须填写固定模型版本")
+    source, revision = source.strip(), revision.strip()
+    if not Path(source).is_dir() and (
+        not re.fullmatch(r"[^\\/:]+/[^\\/:]+", source)
+        or not re.fullmatch(r"[0-9a-f]{40}", revision)
+    ):
+        raise ValueError(
+            "远程 semif_model 需要 owner/repo 和 40 位提交 revision；"
+            "本地模型须为现有目录"
+        )
 
 
 @dataclass(frozen=True)
@@ -37,12 +57,27 @@ class Settings:
     max_wait_seconds: float = 6
     max_messages_after_bot: int = 5
     history_messages: int = 30
+    semantic_backend: str = "jev"
+    semantic_threshold: float = 0.7
     jev_api_key: str = field(default="", repr=False)
     jev_api_url: str = "https://api.typesafe.ai/v1/systemone"
     jev_model: str = "jev-1.13.0"
-    jev_threshold: float = 0.7
     jev_timeout_seconds: float = 10
     jev_retries: int = 1
+    semif_preset: str = CUSTOM_SEMIF_MODEL
+    semif_model: str = ""
+    semif_revision: str = ""
+    semif_device: str = "cuda"
+    semif_dtype: str = "float16"
+    semif_max_tokens: int = 4096
+    semif_batch_rows: int = 8
+    semif_timeout_seconds: float = 30
+    semif_startup_seconds: float = 180
+    laya_model: str = DEFAULT_LAYA_MODEL
+    laya_device: str = "cuda"
+    laya_batch_rows: int = 8
+    laya_timeout_seconds: float = 30
+    laya_startup_seconds: float = 180
 
     @classmethod
     def from_mapping(cls, config: Mapping) -> Settings:
@@ -58,6 +93,28 @@ class Settings:
             ):
                 raise ValueError(f"{name} 必须为字段名是字符串的配置对象")
         configured_fields = config.keys() | keyword_wake.keys() | semantic.keys()
+        old_thresholds = {"jev_threshold", "semif_threshold", "laya_threshold"}
+        removed_thresholds = old_thresholds.intersection(configured_fields)
+        if removed_thresholds:
+            raise ValueError(
+                "旧阈值配置已移除："
+                + ", ".join(sorted(removed_thresholds))
+                + "；请改用 semantic.semantic_threshold"
+            )
+        if "semif_source" in configured_fields:
+            raise ValueError(
+                "semif_source 已移除；SemIf 源码随插件提供，请删除该配置字段"
+            )
+        removed_pythons = {"semif_python", "laya_python"}.intersection(
+            configured_fields
+        )
+        if removed_pythons:
+            raise ValueError(
+                "独立 Python 配置已移除："
+                + ", ".join(sorted(removed_pythons))
+                + "；本地模型统一使用 AstrBot 主程序的 Python，请删除这些字段，"
+                "并在 AstrBot 的 Python 环境中安装模型依赖"
+            )
         if "keyword_case_sensitive" in configured_fields:
             raise ValueError(
                 "keyword_case_sensitive 已移除，请改用 keyword_wake.keyword_ignore_case"
@@ -117,8 +174,12 @@ class Settings:
             "awake_window_seconds",
             "debounce_seconds",
             "max_wait_seconds",
+            "semantic_threshold",
             "jev_timeout_seconds",
-            "jev_threshold",
+            "semif_timeout_seconds",
+            "semif_startup_seconds",
+            "laya_timeout_seconds",
+            "laya_startup_seconds",
         ):
             value = values[name]
             if (
@@ -127,14 +188,17 @@ class Settings:
                 or value <= 0
             ):
                 raise ValueError(f"{name} 必须为有限正数")
-        if values["jev_threshold"] > 1:
-            raise ValueError("jev_threshold 必须在 (0, 1] 内")
+        if values["semantic_threshold"] > 1:
+            raise ValueError("semantic_threshold 必须在 (0, 1] 内")
         if values["max_wait_seconds"] < values["debounce_seconds"]:
             raise ValueError("max_wait_seconds 不能小于 debounce_seconds")
         for name, minimum, maximum in (
             ("max_messages_after_bot", 1, 1000),
             ("history_messages", 1, 1000),
             ("jev_retries", 0, 3),
+            ("semif_max_tokens", 256, 32768),
+            ("semif_batch_rows", 2, 32),
+            ("laya_batch_rows", 2, 32),
         ):
             if type(values[name]) is not int or not minimum <= values[name] <= maximum:
                 raise ValueError(f"{name} 必须是 {minimum}～{maximum} 内的整数")
@@ -168,6 +232,45 @@ class Settings:
             )
         if not re.fullmatch(r"jev-\d+\.\d+\.\d+", values["jev_model"]):
             raise ValueError("jev_model 必须填写固定版本，例如 jev-1.13.0")
+        backend = values["semantic_backend"]
+        if backend not in ("jev", "semif", "laya"):
+            raise ValueError("semantic_backend 只能是 jev、semif 或 laya")
+        for name in (
+            "semif_preset",
+            "semif_model",
+            "semif_revision",
+            "semif_device",
+            "semif_dtype",
+        ):
+            if not isinstance(values[name], str):
+                raise ValueError(f"{name} 必须为字符串")
+            values[name] = values[name].strip()
+        if values["semif_device"] not in ("cuda", "cpu"):
+            raise ValueError("semif_device 只能是 cuda 或 cpu")
+        if values["semif_dtype"] not in ("float16", "bfloat16", "float32"):
+            raise ValueError("semif_dtype 无效")
+        if values["semif_device"] == "cpu" and values["semif_dtype"] != "float32":
+            raise ValueError("semif_device 为 cpu 时 semif_dtype 必须为 float32")
+        if backend == "semif":
+            if values["semif_preset"] not in SEMIF_MODEL_KEYS | {CUSTOM_SEMIF_MODEL}:
+                raise ValueError(
+                    "semif_preset 只能是 custom 或 "
+                    + ", ".join(sorted(SEMIF_MODEL_KEYS))
+                )
+            if values["semif_preset"] == CUSTOM_SEMIF_MODEL:
+                validate_custom_semif_model(
+                    values["semif_model"], values["semif_revision"]
+                )
+        for name in ("laya_model", "laya_device"):
+            if not isinstance(values[name], str):
+                raise ValueError(f"{name} 必须为字符串")
+            values[name] = values[name].strip()
+        if values["laya_device"] not in ("cuda", "cpu"):
+            raise ValueError("laya_device 只能是 cuda 或 cpu")
+        if backend == "laya":
+            if values["laya_model"] not in LAYA_MODEL_KEYS:
+                choices = ", ".join(sorted(LAYA_MODEL_KEYS))
+                raise ValueError(f"laya_model \u53ea\u80fd\u662f {choices}")
         return cls(**values)
 
 
@@ -238,7 +341,7 @@ class WakeController:
 
     Args:
         settings: Validated plugin configuration.
-        judge: Jev evaluator accepting a candidate-validity callback.
+        judge: Semantic evaluator accepting a candidate-validity callback.
         wake: Callback scheduling an independent AstrBot reply task.
         clock: Monotonic clock, injectable for timing verification.
     """
@@ -255,6 +358,9 @@ class WakeController:
         clock: Callable[[], float] = time.monotonic,
     ):
         self.settings, self.judge, self.wake, self.clock = settings, judge, wake, clock
+        self.backend_name = {"jev": "Jev", "semif": "SemIf", "laya": "Laya"}[
+            settings.semantic_backend
+        ]
         self.groups: dict[GroupKey, GroupState] = {}
         self.closed = False
         self.tasks: set[asyncio.Task] = set()
@@ -275,9 +381,9 @@ class WakeController:
                     None,
                 )
                 if idle is None:
-                    raise RuntimeError("Jev group memory capacity exceeded")
+                    raise RuntimeError("语义判断群组内存容量已满")
                 del self.groups[idle]
-                log.warning("Jev evicted idle group history at capacity: %s", idle)
+                log.warning("语义判断已清理容量上限处的空闲群历史：%s", idle)
             self.groups[key] = GroupState()
         return self.groups[key]
 
@@ -355,7 +461,8 @@ class WakeController:
             size -= len(oldest.text.encode("utf-8"))
             self.archive(group, oldest, "capacity_failed")
             log.error(
-                "Jev pending capacity exceeded; archived message %s in %s",
+                "%s pending capacity exceeded; archived message %s in %s",
+                self.backend_name,
                 oldest.id,
                 key,
             )
@@ -455,17 +562,19 @@ class WakeController:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    log.exception("Jev batch failed for %s", key)
+                    log.exception("%s batch failed for %s", self.backend_name, key)
                     results = {}
                 if self.groups.get(key) is not group or self.closed:
                     return
-                log.debug("Jev group=%s probabilities=%s", key, results)
+                log.debug(
+                    "%s group=%s probabilities=%s", self.backend_name, key, results
+                )
                 positive = [
                     m
                     for m in candidates
                     if self.valid(key, group, m)
                     and results.get(m.id) is not None
-                    and results[m.id] >= self.settings.jev_threshold
+                    and results[m.id] >= self.settings.semantic_threshold
                 ]
                 woke = False
                 if positive:
@@ -476,8 +585,9 @@ class WakeController:
                     except Exception:
                         log.exception("Could not schedule semantic wake for %s", key)
                 log.info(
-                    "Jev 唤醒汇总 | 平台=%s | 群=%s | 候选=%d条"
+                    "%s 唤醒汇总 | 平台=%s | 群=%s | 候选=%d条"
                     " | 有效通过=%d条 | 新增唤醒=%s",
+                    self.backend_name,
                     key[0],
                     key[1],
                     len(candidates),

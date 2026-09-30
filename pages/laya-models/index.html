@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>模型管理与测试</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header>
+        <h1>模型管理与测试</h1>
+        <p class="subtitle">下载本地模型，或用 Laya、SemIf、Jev 测试自己的判断场景。</p>
+      </header>
+      <nav class="backend-switch" aria-label="模型后端">
+        <button type="button" data-backend="laya" aria-pressed="true">Laya</button>
+        <button type="button" data-backend="semif" aria-pressed="false">SemIf</button>
+        <button type="button" data-backend="jev" aria-pressed="false">Jev</button>
+      </nav>
+      <div id="notice" class="notice" hidden></div>
+      <section id="models" class="models" aria-live="polite"></section>
+      <section class="playground" aria-labelledby="test-title">
+        <div class="heading">
+          <div>
+            <h2 id="test-title">模型测试</h2>
+            <p class="hint">临时选择任意模型测试，结果仅用于观察判断效果。首次测试需要加载模型。</p>
+          </div>
+        </div>
+        <form id="test-form">
+          <fieldset id="test-fields">
+            <div class="form-grid">
+              <label>测试类型
+                <select id="test-mode">
+                  <option value="wake">群聊唤醒</option>
+                  <option value="choice">通用判断</option>
+                </select>
+              </label>
+              <label id="local-model-field">测试模型
+                <select id="test-model" aria-describedby="model-hint"></select>
+                <span id="model-hint" class="hint">本地模型需要先下载；选择模型后可直接测试。</span>
+              </label>
+              <label id="jev-model-field" hidden>Jev 模型版本
+                <input id="test-jev-model" type="text" value="jev-1.13.0" required pattern="jev-[0-9]+\.[0-9]+\.[0-9]+" />
+                <span class="hint">使用插件配置中的请求地址和 API Key。</span>
+              </label>
+            </div>
+            <div id="wake-fields">
+              <div class="form-grid">
+                <label>机器人 ID
+                  <input id="test-bot-id" type="text" value="bot" maxlength="100" />
+                </label>
+                <label>唤醒阈值
+                  <input id="test-threshold" type="number" min="0.01" max="1" step="0.01" value="0.7" />
+                </label>
+              </div>
+              <label>机器人称呼（用逗号或换行分隔）
+                <input id="test-keywords" type="text" placeholder="小助手, 机器人" />
+              </label>
+              <label>历史对话（JSON 消息数组）
+                <textarea id="test-history" rows="6" spellcheck="false">[
+  {"sender_id": "alice", "text": "帮我推荐一本科幻小说"},
+  {"sender_id": "bot", "text": "可以读《三体》。你喜欢哪类科幻？"}
+]</textarea>
+              </label>
+              <label>待判断消息（JSON 消息数组）
+                <textarea id="test-candidates" rows="5" spellcheck="false">[
+  {"sender_id": "alice", "text": "还有别的推荐吗？"},
+  {"sender_id": "bob", "text": "今晚有人一起打游戏吗？"}
+]</textarea>
+                <span class="hint">每条消息填写 sender_id 和 text；可补充 message_id、mentions、reply 等信息。机器人发言的 sender_id 应与机器人 ID 一致。</span>
+              </label>
+            </div>
+            <div id="choice-fields" hidden>
+              <label>背景 / 待判断内容
+                <textarea id="test-context" rows="5">我的订单已经付款三天了，物流信息一直没有更新，请帮我查询一下。</textarea>
+              </label>
+              <label class="checkbox-label"><input id="context-json" type="checkbox" /> 将背景作为 JSON 对象或数组输入</label>
+              <label>判断问题
+                <textarea id="test-question" rows="2" maxlength="2000">这条客户消息应该交给哪个团队处理？</textarea>
+              </label>
+              <label>候选选项（每行一项，2～16 项）
+                <textarea id="test-options" rows="4">物流团队：处理配送进度、运输异常和物流查询
+售后团队：处理退货、退款和质量问题
+销售团队：处理商品咨询和购买建议</textarea>
+                <span class="hint">填写“是”和“否”即可测试二选一判断；也可写更具体的选项描述。</span>
+              </label>
+            </div>
+            <div class="actions">
+              <button id="test-submit" type="submit">开始测试</button>
+              <button id="test-example" type="button" class="secondary">填入示例</button>
+            </div>
+          </fieldset>
+        </form>
+        <p id="test-status" class="hint" role="status" aria-live="polite"></p>
+        <div id="test-error" class="notice error" role="alert" hidden></div>
+        <section id="test-results" aria-label="测试结果" aria-live="polite"></section>
+      </section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

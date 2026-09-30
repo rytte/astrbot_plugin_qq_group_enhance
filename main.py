@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+import sys
 import time
 from collections.abc import Mapping
+from pathlib import Path
 from sys import maxsize
 from typing import ClassVar
+from uuid import uuid4
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Plain, Reply
 from astrbot.api.star import Context, Star
+from astrbot.api.web import error_response, json_response, request
 from astrbot.core.pipeline.process_stage.stage import ProcessStage
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
@@ -18,8 +24,35 @@ from astrbot.core.star.session_plugin_manager import SessionPluginManager
 
 from .bridge import ACTIVE_PIPELINE, RuntimeObserver
 from .jev import JevClient
+from .laya_client import LayaClient
+from .laya_models import (
+    LAYA_MODELS,
+    get_laya_model_dir,
+    get_laya_model_spec,
+    get_laya_models_dir,
+    is_laya_model_ready,
+    missing_model_files,
+)
+from .model_test import ModelTester
 from .reply import REPLY_KEY, ReplyDispatcher
-from .state import ChatMessage, GroupKey, GroupState, Settings, WakeController
+from .semif import SemIfClient
+from .semif_models import (
+    CUSTOM_SEMIF_MODEL,
+    SEMIF_MODELS,
+    get_semif_model_dir,
+    get_semif_model_spec,
+    get_semif_models_dir,
+    is_semif_model_ready,
+    missing_semif_model_files,
+)
+from .state import (
+    ChatMessage,
+    GroupKey,
+    GroupState,
+    Settings,
+    WakeController,
+    validate_custom_semif_model,
+)
 
 RECORD_KEY = "_qq_group_jev_record"
 CID_KEY = "_qq_group_jev_conversation"
@@ -47,12 +80,13 @@ class GroupWakeFilter(filter.CustomFilter):
 
 
 class QQGroupEnhancePlugin(Star):
-    """Observe group conversations and wake the ordinary reply pipeline via Jev."""
+    """Observe group conversations and wake the reply pipeline via a chosen scorer."""
 
     def __init__(self, context: Context, config: AstrBotConfig | dict | None = None):
         super().__init__(context)
         self.settings: Settings | None = None
-        self.client: JevClient | None = None
+        self.client: JevClient | SemIfClient | LayaClient | None = None
+        self.semantic_failure: str | None = None
         self.controller: WakeController | None = None
         self.config_error: str | None = None
         self.observer = RuntimeObserver(self)
@@ -60,7 +94,65 @@ class QQGroupEnhancePlugin(Star):
         self.closed = False
         self.session_groups: dict[str, GroupKey] = {}
         self.unsupported_profiles: set[tuple[str, str]] = set()
+        self.plugin_config = config if isinstance(config, Mapping) else None
+        self._download_lock = asyncio.Lock()
+        self._download_tasks: dict[str, asyncio.Task] = {}
+        self._download_errors: dict[str, str] = {}
+        self._semif_download_lock = asyncio.Lock()
+        self._semif_download_tasks: dict[str, asyncio.Task] = {}
+        self._semif_download_errors: dict[str, str] = {}
+        self.model_tester = ModelTester()
         GroupWakeFilter.plugin = self
+        register_web_api = getattr(context, "register_web_api", None)
+        if callable(register_web_api):
+            register_web_api(
+                f"/{PLUGIN_NAME}/laya/models",
+                self.page_laya_models,
+                ["GET"],
+                "List Laya models and download status",
+            )
+            register_web_api(
+                f"/{PLUGIN_NAME}/laya/models/download",
+                self.page_laya_model_download,
+                ["POST"],
+                "Download a Laya model",
+            )
+            register_web_api(
+                f"/{PLUGIN_NAME}/laya/models/select",
+                self.page_laya_model_select,
+                ["POST"],
+                "Select the Laya model",
+            )
+            register_web_api(
+                f"/{PLUGIN_NAME}/semif/models",
+                self.page_semif_models,
+                ["GET"],
+                "List SemIf presets and download status",
+            )
+            register_web_api(
+                f"/{PLUGIN_NAME}/semif/models/download",
+                self.page_semif_model_download,
+                ["POST"],
+                "Download a pinned SemIf preset",
+            )
+            register_web_api(
+                f"/{PLUGIN_NAME}/semif/models/select",
+                self.page_semif_model_select,
+                ["POST"],
+                "Select a SemIf preset or custom model",
+            )
+            register_web_api(
+                f"/{PLUGIN_NAME}/semantic/test/settings",
+                self.page_semantic_test_settings,
+                ["GET"],
+                "Get model test settings",
+            )
+            register_web_api(
+                f"/{PLUGIN_NAME}/semantic/test",
+                self.page_semantic_test,
+                ["POST"],
+                "Test a semantic model",
+            )
         try:
             self.settings = Settings.from_mapping({} if config is None else config)
         except ValueError as error:
@@ -68,7 +160,12 @@ class QQGroupEnhancePlugin(Star):
             # config. Invalid settings must never become runtime defaults.
             self.config_error = str(error)
             return
-        self.client = JevClient(self.settings)
+        client_type = {
+            "jev": JevClient,
+            "semif": SemIfClient,
+            "laya": LayaClient,
+        }[self.settings.semantic_backend]
+        self.client = client_type(self.settings)
         self.controller = WakeController(
             self.settings, self._judge, self._semantic_wake
         )
@@ -77,9 +174,353 @@ class QQGroupEnhancePlugin(Star):
     def active(self) -> bool:
         return not self.closed and self.settings is not None
 
+    def _configured_laya_model(self) -> str:
+        config = self.plugin_config
+        if isinstance(config, Mapping):
+            semantic = config.get("semantic")
+            if isinstance(semantic, Mapping) and isinstance(
+                semantic.get("laya_model"), str
+            ):
+                return semantic["laya_model"]
+        if self.settings is not None:
+            return self.settings.laya_model
+        return "multilingual"
+
+    def _configured_semif_preset(self) -> str:
+        config = self.plugin_config
+        if isinstance(config, Mapping):
+            semantic = config.get("semantic")
+            if isinstance(semantic, Mapping) and isinstance(
+                semantic.get("semif_preset"), str
+            ):
+                return semantic["semif_preset"]
+        return (
+            self.settings.semif_preset
+            if self.settings is not None
+            else CUSTOM_SEMIF_MODEL
+        )
+
+    def _semif_model_payload(self, spec) -> dict:
+        task = self._semif_download_tasks.get(spec.key)
+        if task is not None and not task.done():
+            state = "downloading"
+        elif is_semif_model_ready(spec.key):
+            state = "ready"
+        elif spec.key in self._semif_download_errors:
+            state = "error"
+        else:
+            state = "idle"
+        return {
+            "key": spec.key,
+            "label": spec.label,
+            "repo_id": spec.repo_id,
+            "revision": spec.revision,
+            "description": spec.description,
+            "state": state,
+            "error": self._semif_download_errors.get(spec.key),
+            "selected": spec.key == self._configured_semif_preset(),
+        }
+
+    async def page_semif_models(self):
+        return json_response(
+            {
+                "selected": self._configured_semif_preset(),
+                "models": [self._semif_model_payload(spec) for spec in SEMIF_MODELS],
+            }
+        )
+
+    async def page_semif_model_select(self):
+        payload = await request.json(default={})
+        key = payload.get("model") if isinstance(payload, Mapping) else None
+        if key != CUSTOM_SEMIF_MODEL:
+            try:
+                get_semif_model_spec(key)
+            except (TypeError, ValueError) as error:
+                return error_response(str(error), status_code=400)
+        config = self.plugin_config
+        if not isinstance(config, Mapping) or not hasattr(config, "save_config"):
+            return error_response(
+                "插件配置不可写，请在 AstrBot 插件配置中选择模型", status_code=409
+            )
+        semantic = config.get("semantic")
+        if not isinstance(semantic, dict):
+            semantic = {}
+        if key == CUSTOM_SEMIF_MODEL:
+            try:
+                validate_custom_semif_model(
+                    semantic.get("semif_model"), semantic.get("semif_revision")
+                )
+            except ValueError as error:
+                return error_response(str(error), status_code=400)
+        config["semantic"] = semantic
+        semantic["semif_preset"] = key
+        config.save_config()
+        return json_response({"selected": key, "requires_reload": True})
+
+    async def page_semif_model_download(self):
+        payload = await request.json(default={})
+        key = payload.get("model") if isinstance(payload, Mapping) else None
+        try:
+            spec = get_semif_model_spec(key)
+        except (TypeError, ValueError) as error:
+            return error_response(str(error), status_code=400)
+        async with self._semif_download_lock:
+            task = self._semif_download_tasks.get(spec.key)
+            if task is not None and not task.done():
+                return json_response(self._semif_model_payload(spec))
+            if is_semif_model_ready(spec.key):
+                self._semif_download_errors.pop(spec.key, None)
+                return json_response(self._semif_model_payload(spec))
+            self._semif_download_errors.pop(spec.key, None)
+            self._semif_download_tasks[spec.key] = asyncio.create_task(
+                self._download_semif_model(spec)
+            )
+        return json_response(self._semif_model_payload(spec))
+
+    async def _download_semif_model(self, spec) -> None:
+        models_dir = get_semif_models_dir()
+        temp_dir = models_dir / ".downloads" / f"{spec.key}-{uuid4().hex}"
+        target_dir = get_semif_model_dir(spec.key)
+        process: asyncio.subprocess.Process | None = None
+        try:
+            temp_dir.parent.mkdir(parents=True, exist_ok=True)
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-u",
+                str(Path(__file__).with_name("semif_download_worker.py")),
+                "--repo",
+                spec.repo_id,
+                "--revision",
+                spec.revision,
+                "--target",
+                str(temp_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={
+                    **os.environ,
+                    "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+                    "TQDM_DISABLE": "1",
+                    "PYTHONIOENCODING": "utf-8",
+                },
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=3600
+                )
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+                raise RuntimeError("模型下载超过 1 小时")
+            if process.returncode != 0:
+                details = (stdout or stderr).decode("utf-8", errors="replace").strip()
+                raise RuntimeError(details[-1000:] or "模型下载失败")
+            missing = missing_semif_model_files(temp_dir, spec)
+            if missing:
+                raise RuntimeError("模型下载不完整，缺少文件：" + ", ".join(missing))
+            backup = models_dir / ".downloads" / f"old-{spec.key}-{uuid4().hex}"
+            if target_dir.exists():
+                target_dir.rename(backup)
+            try:
+                temp_dir.rename(target_dir)
+            except Exception:
+                if backup.exists() and not target_dir.exists():
+                    backup.rename(target_dir)
+                raise
+            if backup.exists():
+                shutil.rmtree(backup)
+        except asyncio.CancelledError:
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+            raise
+        except Exception as error:
+            self._semif_download_errors[spec.key] = str(error)
+        finally:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _laya_model_payload(self, spec) -> dict:
+        task = self._download_tasks.get(spec.key)
+        if task is not None and not task.done():
+            state = "downloading"
+        elif is_laya_model_ready(spec.key):
+            state = "ready"
+        elif spec.key in self._download_errors:
+            state = "error"
+        else:
+            state = "idle"
+        return {
+            "key": spec.key,
+            "label": spec.label,
+            "repo_id": spec.repo_id,
+            "description": spec.description,
+            "state": state,
+            "downloaded": state == "ready",
+            "error": self._download_errors.get(spec.key),
+            "selected": spec.key == self._configured_laya_model(),
+        }
+
+    async def page_laya_models(self):
+        return json_response(
+            {
+                "selected": self._configured_laya_model(),
+                "models": [self._laya_model_payload(spec) for spec in LAYA_MODELS],
+            }
+        )
+
+    async def page_laya_model_select(self):
+        payload = await request.json(default={})
+        model_key = payload.get("model") if isinstance(payload, Mapping) else None
+        try:
+            spec = get_laya_model_spec(model_key)
+        except (TypeError, ValueError) as error:
+            return error_response(str(error), status_code=400)
+        config = self.plugin_config
+        if not isinstance(config, Mapping) or not hasattr(config, "save_config"):
+            return error_response(
+                "\u63d2\u4ef6\u914d\u7f6e\u4e0d\u53ef\u5199\uff0c"
+                "\u8bf7\u5728 AstrBot "
+                "\u63d2\u4ef6\u8bbe\u7f6e\u4e2d\u9009\u62e9\u6a21\u578b",
+                status_code=409,
+            )
+        semantic = config.get("semantic")
+        if not isinstance(semantic, dict):
+            semantic = {}
+            config["semantic"] = semantic
+        semantic["laya_model"] = spec.key
+        config.save_config()
+        return json_response({"selected": spec.key, "requires_reload": True})
+
+    async def page_laya_model_download(self):
+        payload = await request.json(default={})
+        model_key = payload.get("model") if isinstance(payload, Mapping) else None
+        try:
+            spec = get_laya_model_spec(model_key)
+        except (TypeError, ValueError) as error:
+            return error_response(str(error), status_code=400)
+        async with self._download_lock:
+            task = self._download_tasks.get(spec.key)
+            if task is not None and not task.done():
+                return json_response(self._laya_model_payload(spec))
+            if is_laya_model_ready(spec.key):
+                self._download_errors.pop(spec.key, None)
+                return json_response(self._laya_model_payload(spec))
+            self._download_errors.pop(spec.key, None)
+            task = asyncio.create_task(self._download_model(spec))
+            self._download_tasks[spec.key] = task
+        return json_response(self._laya_model_payload(spec))
+
+    async def page_semantic_test_settings(self):
+        if self.settings is None:
+            return error_response(self.config_error or "插件配置无效", status_code=400)
+        settings = self.settings
+        return json_response(
+            {
+                "backend": settings.semantic_backend,
+                "threshold": settings.semantic_threshold,
+                "keywords": list(settings.keywords),
+                "jev": {
+                    "model": settings.jev_model,
+                    "configured": bool(settings.jev_api_key),
+                },
+                "laya": {"model": self._configured_laya_model()},
+                "semif": {"model": self._configured_semif_preset()},
+            }
+        )
+
+    async def page_semantic_test(self):
+        if self.closed:
+            return error_response("插件已卸载", status_code=409)
+        if self.settings is None:
+            return error_response(self.config_error or "插件配置无效", status_code=400)
+        if self.model_tester.busy:
+            return error_response("已有模型测试正在运行，请稍后再试", status_code=409)
+        try:
+            payload = await request.json(default={})
+            config = self.plugin_config if self.plugin_config is not None else {}
+            return json_response(await self.model_tester.run(config, payload))
+        except ValueError as error:
+            return error_response(str(error), status_code=400)
+        except TimeoutError:
+            return error_response(
+                "模型测试超时，请检查模型设备和超时配置", status_code=504
+            )
+        except Exception as error:
+            secret = self.settings.jev_api_key
+            message = str(error) or type(error).__name__
+            if secret:
+                message = message.replace(secret, "[已隐藏密钥]")
+            return error_response(message, status_code=502)
+
+    async def _download_model(self, spec) -> None:
+        models_dir = get_laya_models_dir()
+        temp_dir = models_dir / ".downloads" / f"{spec.key}-{uuid4().hex}"
+        target_dir = get_laya_model_dir(spec.key)
+        process: asyncio.subprocess.Process | None = None
+        try:
+            models_dir.mkdir(parents=True, exist_ok=True)
+            temp_dir.parent.mkdir(parents=True, exist_ok=True)
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-u",
+                str(Path(__file__).with_name("laya_download_worker.py")),
+                "--repo",
+                spec.repo_id,
+                "--target",
+                str(temp_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={
+                    **os.environ,
+                    "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+                    "TQDM_DISABLE": "1",
+                    "PYTHONIOENCODING": "utf-8",
+                },
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=3600
+                )
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+                raise RuntimeError("模型下载超过 1 小时")
+            if process.returncode != 0:
+                details = (stdout or stderr).decode("utf-8", errors="replace").strip()
+                raise RuntimeError(details[-1000:] or "模型下载失败")
+            missing = missing_model_files(temp_dir)
+            if missing:
+                raise RuntimeError("模型下载不完整，缺少文件：" + ", ".join(missing))
+            backup = models_dir / ".downloads" / f"old-{spec.key}-{uuid4().hex}"
+            if target_dir.exists():
+                target_dir.rename(backup)
+            try:
+                temp_dir.rename(target_dir)
+            except Exception:
+                if backup.exists() and not target_dir.exists():
+                    backup.rename(target_dir)
+                raise
+            if backup.exists():
+                shutil.rmtree(backup)
+        except asyncio.CancelledError:
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+            raise
+        except Exception as error:
+            self._download_errors[spec.key] = str(error)
+        finally:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
     @property
     def semantic_enabled(self) -> bool:
-        return self.active and self.settings.enabled and bool(self.settings.jev_api_key)
+        return bool(
+            self.active
+            and self.settings.enabled
+            and self.semantic_failure is None
+            and (self.settings.semantic_backend != "jev" or self.settings.jev_api_key)
+        )
 
     def serves_group(self, group_id: str) -> bool:
         return bool(
@@ -105,12 +546,29 @@ class QQGroupEnhancePlugin(Star):
             except Exception:
                 self.observer.close()
                 raise
+            if self.settings.enabled and self.settings.semantic_backend in (
+                "semif",
+                "laya",
+            ):
+                try:
+                    await self.client.start()
+                except Exception as error:
+                    self.semantic_failure = str(error)
+                    logger.exception(
+                        "%s 启动失败，语义判断已暂停；关键词、@和引用唤醒仍可用。"
+                        "请检查 AstrBot 的 Python 环境中的模型依赖、"
+                        "模型路径和显存后重载插件。",
+                        self.controller.backend_name,
+                    )
             if not self.settings.enabled:
                 logger.info(
-                    "Jev 语义判断已关闭：保留关键词、@和引用的直接唤醒及内存历史；"
-                    "不建立待判窗口，不请求 Jev。"
+                    "语义判断已关闭：保留关键词、@和引用的直接唤醒及内存历史；"
+                    "不建立待判窗口。"
                 )
-            elif not self.settings.jev_api_key:
+            elif (
+                self.settings.semantic_backend == "jev"
+                and not self.settings.jev_api_key
+            ):
                 logger.warning(
                     "未配置 jev_api_key：插件已加载，直接唤醒正常运行；"
                     "Jev 语义判断暂停。请在插件配置中填写密钥并重载插件。"
@@ -252,7 +710,7 @@ class QQGroupEnhancePlugin(Star):
         if not bot and event.is_at_or_wake_command:
             self.controller.awakened(key)
         if not mid:
-            logger.error("Jev cannot track a QQ message without a message ID")
+            logger.error("语义判断无法追踪缺少消息 ID 的 QQ 消息")
             return
         record = ChatMessage(
             id=mid,
@@ -437,7 +895,10 @@ class QQGroupEnhancePlugin(Star):
             if report not in self.unsupported_profiles:
                 self.unsupported_profiles.add(report)
                 logger.error(
-                    "Jev 语义唤醒未运行：%s（%s）", reason, event.unified_msg_origin
+                    "%s 语义唤醒未运行：%s（%s）",
+                    self.controller.backend_name,
+                    reason,
+                    event.unified_msg_origin,
                 )
             return False
         cid = await self.context.conversation_manager.get_curr_conversation_id(
@@ -486,6 +947,15 @@ class QQGroupEnhancePlugin(Star):
 
     async def terminate(self) -> None:
         self.closed = True
+        await self.model_tester.close()
+        downloads = list(self._download_tasks.values()) + list(
+            self._semif_download_tasks.values()
+        )
+        for task in downloads:
+            if not task.done():
+                task.cancel()
+        if downloads:
+            await asyncio.gather(*downloads, return_exceptions=True)
         if GroupWakeFilter.plugin is self:
             GroupWakeFilter.plugin = None
         if self.controller is not None:

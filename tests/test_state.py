@@ -33,10 +33,32 @@ def test_retired_configuration_is_rejected(field):
 
 
 @pytest.mark.parametrize(
+    "field", ("jev_threshold", "semif_threshold", "laya_threshold")
+)
+def test_old_backend_thresholds_require_single_shared_field(field):
+    with pytest.raises(ValueError, match="semantic.semantic_threshold"):
+        Settings.from_mapping({"semantic": {field: 0.9}})
+
+
+def test_removed_semif_source_requires_config_cleanup():
+    with pytest.raises(ValueError, match="semif_source 已移除"):
+        Settings.from_mapping({"semantic": {"semif_source": "D:/old-source"}})
+
+
+@pytest.mark.parametrize("field", ["semif_python", "laya_python"])
+@pytest.mark.parametrize("group", [None, "semantic", "keyword_wake"])
+@pytest.mark.parametrize("value", ["D:/old-python/python.exe", "", None])
+def test_removed_python_configuration_requires_cleanup(field, group, value):
+    config = {field: value} if group is None else {group: {field: value}}
+    with pytest.raises(ValueError, match=f"{field}.*AstrBot 主程序的 Python"):
+        Settings.from_mapping(config)
+
+
+@pytest.mark.parametrize(
     "config",
     [
-        {"semantic": {"jev_threshold": float("nan")}},
-        {"semantic": {"jev_threshold": 2}},
+        {"semantic": {"semantic_threshold": float("nan")}},
+        {"semantic": {"semantic_threshold": 2}},
         {"semantic": {"history_messages": True}},
         {"semantic": {"history_messages": 0}},
         {"semantic": {"debounce_seconds": 0}},
@@ -85,7 +107,7 @@ def test_configuration_defaults_and_secret():
     assert settings.keywords == ()
     assert settings.keyword_ignore_case is True
     assert settings.preserve_bot_mention is True
-    assert settings.jev_threshold == 0.7
+    assert settings.semantic_threshold == 0.7
     assert (settings.history_messages, settings.awake_window_seconds) == (30, 180)
     assert (settings.debounce_seconds, settings.max_wait_seconds) == (3, 6)
     assert settings.max_messages_after_bot == 5
@@ -213,13 +235,34 @@ def test_grouped_configuration_round_trip_and_visibility(tmp_path):
     assert all("condition" not in item for item in keyword_items.values())
     assert schema["semantic"]["type"] == "object"
     items = schema["semantic"]["items"]
+    assert "semif_python" not in items
+    assert "laya_python" not in items
     assert next(iter(items)) == "enabled"
     assert "condition" not in items["enabled"]
-    assert all(
-        item.get("condition") == {"enabled": True}
-        for key, item in items.items()
-        if key != "enabled"
-    )
+    assert items["semantic_backend"]["options"] == ["jev", "semif", "laya"]
+    assert items["semantic_threshold"]["default"] == 0.7
+    keys = list(items)
+    shared_start = keys.index("awake_window_seconds")
+    assert keys[shared_start - 1] == "semantic_threshold"
+    assert keys[2 : shared_start - 1] == [
+        key
+        for prefix in ("jev_", "semif_", "laya_")
+        for key in keys
+        if key.startswith(prefix)
+    ]
+    for key, item in items.items():
+        if key == "enabled":
+            continue
+        condition = {"enabled": True}
+        if key.startswith("jev_"):
+            condition["semantic_backend"] = "jev"
+        if key.startswith("semif_"):
+            condition["semantic_backend"] = "semif"
+            if key in {"semif_model", "semif_revision"}:
+                condition["semif_preset"] = "custom"
+        if key.startswith("laya_"):
+            condition["semantic_backend"] = "laya"
+        assert item.get("condition") == condition
 
     path = str(tmp_path / "plugin.json")
     config = AstrBotConfig(path, schema=schema)
@@ -231,7 +274,7 @@ def test_grouped_configuration_round_trip_and_visibility(tmp_path):
     config["semantic"].update(
         enabled=False,
         jev_api_key="test-secret",
-        jev_threshold=0.9,
+        semantic_threshold=0.9,
         history_messages=45,
         jev_api_url="https://proxy.example.com/custom/jev",
     )
@@ -247,7 +290,7 @@ def test_grouped_configuration_round_trip_and_visibility(tmp_path):
         enabled=False,
         jev_api_key="test-secret",
         jev_api_url="https://proxy.example.com/custom/jev",
-        jev_threshold=0.9,
+        semantic_threshold=0.9,
         history_messages=45,
     )
     reloaded["semantic"]["enabled"] = True

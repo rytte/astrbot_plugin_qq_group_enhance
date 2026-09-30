@@ -31,22 +31,41 @@
   },
   "semantic": {
     "type": "object",
-    "description": "Jev 语义唤醒",
+    "description": "语义唤醒",
     "hint": "修改后保存并重载插件生效。",
     "default": {},
     "items": {
       "enabled": {
         "type": "bool",
-        "description": "启用 Jev 语义判断",
+        "description": "启用语义判断",
         "default": true,
         "hint": "仅控制语义判断，不影响关键词、@和引用唤醒。需开启 AstrBot 的“群聊消息记录注入上下文”。"
+      },
+      "semantic_backend": {
+        "type": "string",
+        "description": "语义判断后端",
+        "default": "jev",
+        "options": [
+          "jev",
+          "semif",
+          "laya"
+        ],
+        "labels": [
+          "Jev 云端",
+          "SemIf 本地",
+          "Laya 本地"
+        ],
+        "condition": {
+          "enabled": true
+        }
       },
       "jev_api_url": {
         "type": "string",
         "description": "Jev 请求地址",
         "default": "https://api.typesafe.ai/v1/systemone",
         "condition": {
-          "enabled": true
+          "enabled": true,
+          "semantic_backend": "jev"
         },
         "hint": "填写兼容 Jev 的完整 HTTP(S) 接口地址，不会自动追加路径。"
       },
@@ -55,7 +74,8 @@
         "description": "TypeSafe AI / Jev API Key",
         "default": "",
         "condition": {
-          "enabled": true
+          "enabled": true,
+          "semantic_backend": "jev"
         },
         "hint": "留空暂停语义判断。群聊内容会发送到配置的请求地址。"
       },
@@ -64,9 +84,198 @@
         "description": "Jev 固定模型版本",
         "default": "jev-1.13.0",
         "condition": {
-          "enabled": true
+          "enabled": true,
+          "semantic_backend": "jev"
         },
         "hint": "填写固定版本号，如 jev-1.13.0，不支持 latest 或 preview。"
+      },
+      "jev_timeout_seconds": {
+        "type": "float",
+        "description": "Jev 单次请求超时（秒）",
+        "default": 10.0,
+        "condition": {
+          "enabled": true,
+          "semantic_backend": "jev"
+        },
+        "hint": "每次请求独立计时，超时后按重试次数处理。"
+      },
+      "jev_retries": {
+        "type": "int",
+        "description": "Jev 失败后的重试次数",
+        "default": 1,
+        "condition": {
+          "enabled": true,
+          "semantic_backend": "jev"
+        },
+        "minimum": 0,
+        "maximum": 3,
+        "hint": "失败后的额外尝试次数，设为 0 不重试。"
+      },
+      "semif_preset": {
+        "type": "string",
+        "description": "SemIf 模型选择",
+        "default": "custom",
+        "options": ["custom", "qwen3-0.6b", "qwen3.5-0.8b", "minicpm5-2b", "qwen3.5-4b"],
+        "labels": ["自定义模型", "Qwen3 0.6B", "Qwen3.5 0.8B", "MiniCPM5 2B", "Qwen3.5 4B"],
+        "condition": {"enabled": true, "semantic_backend": "semif"},
+        "hint": "预设模型可在插件页面下载；自定义模型继续使用下方模型目录或 Hugging Face ID。"
+      },
+      "semif_model": {
+        "type": "string",
+        "description": "SemIf 模型目录或 Hugging Face ID",
+        "default": "",
+        "condition": {"enabled": true, "semantic_backend": "semif", "semif_preset": "custom"},
+        "hint": "本地模型填现有目录；远程模型填 owner/repo 并指定 40 位提交版本。"
+      },
+      "semif_revision": {
+        "type": "string",
+        "description": "SemIf 固定模型版本",
+        "default": "",
+        "condition": {"enabled": true, "semantic_backend": "semif", "semif_preset": "custom"},
+        "hint": "填写模型的固定 revision；本地模型可填其来源提交号。"
+      },
+      "semif_device": {
+        "type": "string",
+        "description": "SemIf 计算设备",
+        "default": "cuda",
+        "options": [
+          "cuda",
+          "cpu"
+        ],
+        "condition": {
+          "enabled": true,
+          "semantic_backend": "semif"
+        }
+      },
+      "semif_dtype": {
+        "type": "string",
+        "description": "SemIf 模型精度",
+        "default": "float16",
+        "options": [
+          "float16",
+          "bfloat16",
+          "float32"
+        ],
+        "condition": {
+          "enabled": true,
+          "semantic_backend": "semif"
+        },
+        "hint": "RTX 2060 建议 float16；CPU 模式必须选 float32。"
+      },
+      "semif_max_tokens": {
+        "type": "int",
+        "description": "SemIf 单题输入 Token 上限",
+        "default": 4096,
+        "minimum": 256,
+        "maximum": 32768,
+        "condition": {
+          "enabled": true,
+          "semantic_backend": "semif"
+        },
+        "hint": "超限时只移除最早的历史，仍超限则明确报错，不截断候选消息。"
+      },
+      "semif_batch_rows": {
+        "type": "int",
+        "description": "SemIf 单次共享评分题数",
+        "default": 8,
+        "minimum": 2,
+        "maximum": 32,
+        "condition": {
+          "enabled": true,
+          "semantic_backend": "semif"
+        },
+        "hint": "每条候选消息需正反两题，显存紧张时设为 2。"
+      },
+      "semif_timeout_seconds": {
+        "type": "float",
+        "description": "SemIf 单批判断超时（秒）",
+        "default": 30.0,
+        "condition": {
+          "enabled": true,
+          "semantic_backend": "semif"
+        }
+      },
+      "semif_startup_seconds": {
+        "type": "float",
+        "description": "SemIf 模型加载超时（秒）",
+        "default": 180.0,
+        "condition": {
+          "enabled": true,
+          "semantic_backend": "semif"
+        }
+      },
+      "laya_model": {
+        "type": "string",
+        "description": "Laya 模型",
+        "default": "multilingual",
+        "condition": {
+          "enabled": true,
+          "semantic_backend": "laya"
+        },
+        "hint": "选择已下载到插件数据目录的 Laya 模型；模型可在插件页面下载。",
+        "options": [
+          "english",
+          "multilingual",
+          "typed-decisions"
+        ],
+        "labels": [
+          "English",
+          "Multilingual",
+          "Typed Decisions"
+        ]
+      },
+      "laya_device": {
+        "type": "string",
+        "description": "Laya 计算设备",
+        "default": "cuda",
+        "options": [
+          "cuda",
+          "cpu"
+        ],
+        "condition": {
+          "enabled": true,
+          "semantic_backend": "laya"
+        },
+        "hint": "若指定设备不可用则启动失败，不自动切换到 CPU。"
+      },
+      "laya_batch_rows": {
+        "type": "int",
+        "description": "Laya 单次推理题数",
+        "default": 8,
+        "minimum": 2,
+        "maximum": 32,
+        "condition": {
+          "enabled": true,
+          "semantic_backend": "laya"
+        },
+        "hint": "每条候选消息需正反两题；显存紧张时设为 2。"
+      },
+      "laya_timeout_seconds": {
+        "type": "float",
+        "description": "Laya 单批判断超时（秒）",
+        "default": 30.0,
+        "condition": {
+          "enabled": true,
+          "semantic_backend": "laya"
+        }
+      },
+      "laya_startup_seconds": {
+        "type": "float",
+        "description": "Laya 模型加载超时（秒）",
+        "default": 180.0,
+        "condition": {
+          "enabled": true,
+          "semantic_backend": "laya"
+        }
+      },
+      "semantic_threshold": {
+        "type": "float",
+        "description": "接话概率阈值",
+        "default": 0.7,
+        "condition": {
+          "enabled": true
+        },
+        "hint": "适用于所有语义后端；大于 0 且不超过 1，越高越保守。"
       },
       "awake_window_seconds": {
         "type": "float",
@@ -79,7 +288,7 @@
       },
       "debounce_seconds": {
         "type": "float",
-        "description": "Jev 防抖等待（秒）",
+        "description": "语义判断防抖等待（秒）",
         "default": 3.0,
         "condition": {
           "enabled": true
@@ -88,7 +297,7 @@
       },
       "max_wait_seconds": {
         "type": "float",
-        "description": "Jev 最长聚合等待（秒）",
+        "description": "语义判断最长聚合等待（秒）",
         "default": 6.0,
         "condition": {
           "enabled": true
@@ -108,43 +317,14 @@
       },
       "history_messages": {
         "type": "int",
-        "description": "Jev 历史消息缓存条数",
+        "description": "语义判断历史消息缓存条数",
         "default": 30,
         "condition": {
           "enabled": true
         },
         "minimum": 1,
         "maximum": 1000,
-        "hint": "用于 Jev 判断的历史消息条数，不含待判消息；重载后清空。"
-      },
-      "jev_threshold": {
-        "type": "float",
-        "description": "逐条语义判断通过阈值",
-        "default": 0.7,
-        "condition": {
-          "enabled": true
-        },
-        "hint": "大于 0 且不超过 1；值越高，唤醒判断越保守。"
-      },
-      "jev_timeout_seconds": {
-        "type": "float",
-        "description": "Jev 单次请求超时（秒）",
-        "default": 10.0,
-        "condition": {
-          "enabled": true
-        },
-        "hint": "每次请求独立计时，超时后按重试次数处理。"
-      },
-      "jev_retries": {
-        "type": "int",
-        "description": "Jev 失败后的重试次数",
-        "default": 1,
-        "condition": {
-          "enabled": true
-        },
-        "minimum": 0,
-        "maximum": 3,
-        "hint": "失败后的额外尝试次数，设为 0 不重试。"
+        "hint": "用于语义判断的历史消息条数，不含待判消息；重载后清空。"
       }
     }
   }

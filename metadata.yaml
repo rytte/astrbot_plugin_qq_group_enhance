@@ -1,6 +1,6 @@
 name: astrbot_plugin_qq_group_enhance
 display_name: QQ 群聊增强
-desc: 用于增强 QQ机器人的群聊能力，支持关键词唤醒、JEV 语义唤醒和@优化。
+desc: 用于增强 QQ机器人的群聊能力，支持关键词唤醒、Jev／SemIf／Laya 语义唤醒和@优化。
 version: 0.3.0
 author: rytte
 repo: https://github.com/rytte/astrbot_plugin_qq_group_enhance

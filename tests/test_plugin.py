@@ -1463,9 +1463,9 @@ async def test_disabled_semantics_blocks_queued_reply_before_provider(
         {"group_whitelist": "100"},
         {"group_whitelist": [""]},
         {"preserve_bot_mention": "false"},
-        {"semantic": {"jev_threshold": 0}},
-        {"semantic": {"jev_threshold": "0.75"}},
-        {"semantic": {"jev_threshold": 2}},
+        {"semantic": {"semantic_threshold": 0}},
+        {"semantic": {"semantic_threshold": "0.75"}},
+        {"semantic": {"semantic_threshold": 2}},
         {"semantic": {"debounce_seconds": 0}},
         {"semantic": {"awake_observe_seconds": 5}},
         {"semantic": {"max_messages_after_bot": 0}},
@@ -1521,28 +1521,28 @@ async def test_invalid_config_logs_reason_preserves_values_and_recovers_on_reloa
 ):
     error_log = MagicMock()
     monkeypatch.setattr(main.logger, "error", error_log)
-    config = {"semantic": {"jev_api_key": "test-secret", "jev_threshold": 0}}
+    config = {"semantic": {"jev_api_key": "test-secret", "semantic_threshold": 0}}
     original = deepcopy(config)
     plugin = QQGroupEnhancePlugin(SimpleNamespace(), config)
     try:
         await plugin.initialize()
-        assert "jev_threshold" in plugin.config_error
+        assert "semantic_threshold" in plugin.config_error
         assert config == original
         error_log.assert_called_once()
         rendered = error_log.call_args.args[0] % error_log.call_args.args[1:]
         assert "插件已加载" in rendered
         assert "WebUI" in rendered
-        assert "jev_threshold" in rendered
+        assert "semantic_threshold" in rendered
         assert "test-secret" not in rendered
     finally:
         await plugin.terminate()
-    config["semantic"]["jev_threshold"] = 0.9
+    config["semantic"]["semantic_threshold"] = 0.9
     reloaded = QQGroupEnhancePlugin(SimpleNamespace(), config)
     try:
         await reloaded.initialize()
         assert reloaded.active
         assert reloaded.config_error is None
-        assert reloaded.settings.jev_threshold == 0.9
+        assert reloaded.settings.semantic_threshold == 0.9
         assert reloaded.observer.installed
         assert reloaded.client is not None
         assert reloaded.controller is not None
@@ -1641,10 +1641,13 @@ def qq_enrichment(harness):
             "component_spoof_protection": {"enabled": False},
             "semanticize_components": True,
             "enhance_voice_messages": True,
-            "respond_to_red_packet": False,
-            "respond_to_poke": False,
             "max_semantic_chars": 2000,
         },
+        "interaction_response": {
+            "respond_to_red_packet": False,
+            "respond_to_poke": False,
+        },
+        "voice_recognition": {"enhance_voice_messages": True},
         "limits": {"max_components": 50},
     }
     qq.runtime = SimpleNamespace(
@@ -1661,7 +1664,7 @@ def qq_enrichment(harness):
     indirect=True,
 )
 @pytest.mark.usefixtures("awake_group")
-async def test_collects_real_qq_enrichment_before_debounce_without_outline_overwrite(
+async def test_collects_real_qq_enrichment_before_debounce_with_semanticized_outline(
     harness, qq_enrichment
 ):
     event = make_event("你怎么看", parts=[Plain("你怎么看"), Face(id=14)])
@@ -1681,7 +1684,7 @@ async def test_collects_real_qq_enrichment_before_debounce_without_outline_overw
     assert "QQ表情：微笑" in record.text
     assert "QQ链接分享：新闻标题" in record.text
     assert record.text.count("你怎么看") == 1
-    assert "QQ表情：微笑" not in event.get_message_outline()
+    assert event.get_message_outline().count("QQ表情：微笑") == 1
     assert seen == [(True, event.message_str)]
     harness.plugin.refresh(event)
     assert record.text == event.message_str
