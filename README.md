@@ -71,15 +71,17 @@
 需要 **AstrBot `>=4.27.4,<5`**、Python 3.12+，以及 `aiocqhttp` / NapCat OneBot v11。语义唤醒使用 AstrBot **本地 Agent 执行器**。当前回归测试基于 AstrBot **4.27.4**，新版本的内部接口仍需验证。
 
 1. 将插件目录放入 `data/plugins/astrbot_plugin_qq_group_enhance`，在 AstrBot 中加载插件。
-2. 打开插件配置，在 **语义唤醒**中选择后端。Jev 需填写 API Key，见 [Jev 接入与配置](JEV.md#接入与配置)；SemIf 和 Laya 的源码随插件提供，模型加载和下载统一使用 AstrBot 主程序的 Python，需在该环境中安装模型依赖。AstrBot WebUI 侧边栏的 **模型管理与测试** 页面可切换 Laya／SemIf 并下载、选择模型，也可直接测试 Jev；SemIf 支持自定义模型目录或 Hugging Face ID，见 [SemIf 本地接入](SEMIF.md)和 [Laya 本地接入](LAYA.md)。
+2. 打开插件配置，在 **语义唤醒**中选择后端。Jev 需填写 API Key，见 [Jev 接入与配置](JEV.md#接入与配置)；SemIf 和 Laya 的源码随插件提供，模型加载和下载统一使用 AstrBot 主程序的 Python，需在该环境中安装模型依赖。AstrBot WebUI 侧边栏的 **模型实验场** 页面是独立的模型实验场，可在模型列表中下载本地模型并选择它进行测试，不会修改插件配置；SemIf 支持自定义模型目录或 Hugging Face ID，见 [SemIf 本地接入](SEMIF.md)和 [Laya 本地接入](LAYA.md)。
 3. 保存配置并重载插件。先 @机器人聊一句，再发送不带 @ 的追问，观察它是否接话。
 
 ## 🧪 页面测试
 
-进入 **模型管理与测试**，选择 Laya、SemIf 或 Jev。本地预设需先下载完整；下载后可直接测试任意已下载模型，无需先切换群聊后端或重载插件。SemIf 的自定义模型使用配置中的路径与固定版本；Jev 使用配置中的请求地址、API Key，可临时填写其他固定模型版本。
+进入 **模型实验场**，在模型列表中点击“选择测试”即可将模型带入本次测试。本地预设需先下载完整；下载后可直接测试任意已下载模型，无需切换群聊后端或重载插件。SemIf 的自定义模型使用配置中的路径与固定版本；Jev 使用配置中的请求地址、API Key，可临时填写其他固定模型版本。
 
 - **群聊唤醒**：填写机器人 ID、称呼、阈值、历史对话和待判断消息。消息采用 JSON 数组，每条包含 `sender_id` 与 `text`，可补充 `message_id`、`mentions`、`reply` 等元数据。机器人发言的 `sender_id` 应与机器人 ID 一致。结果显示每条候选的唤醒概率和是否达到阈值；Laya／SemIf 使用与群聊相同的正反选项顺序平均分。
-- **通用判断**：填写背景文本或 JSON、判断问题及 2～16 个选项（每行一项）。填写“是／否”可做二选一判断。结果显示选中的选项、各选项概率和耗时；Jev 使用原生 `choice`，本地模型使用相应的选项评分。
+- **Choice**：填写背景文本或 JSON、判断问题及 2～16 个选项，结果显示最高概率选项和完整概率分布。
+- **Score**：使用相同输入，但只返回每个选项的评分，不强制选出赢家，适合比较候选项。
+- **Noul**：填写一个需要判断成立概率的命题；Jev 使用原生 `noul`，本地模型使用“是／否”评分近似。
 
 测试独立于群聊消息流程，不发送 QQ 消息，不保存测试输入，也不修改插件配置。首次本地测试的耗时包含模型加载；相同配置下复用独立测试进程，切换模型或卸载插件时释放。该进程与群聊模型同时使用内存／显存。云端测试会调用 Jev 服务并按服务商规则计费。
 
@@ -116,10 +118,9 @@
 | [laya_client.py](laya_client.py) | Laya 启动参数 |
 | [laya_worker.py](laya_worker.py) | 使用 AstrBot Python 的子进程 Laya `choice` 评分与截断预检 |
 | [laya_models.py](laya_models.py) | Laya 三个模型的规格、模型 key 校验和 plugin_data 路径 |
-| [pages/laya-models](pages/laya-models) | Laya／SemIf 模型管理及三种后端的测试页面 |
+| [pages/laya-models](pages/laya-models) | Laya／SemIf／Jev 模型实验场，可下载模型并测试 Choice／Score／Noul |
 | [model_test.py](model_test.py) | 独立测试输入校验、模型生命周期和概率结果 |
 | [semif_models.py](semif_models.py) | SemIf 预设模型、固定版本和模型文件校验 |
-| [pages/semif-models](pages/semif-models) | SemIf 预设选择、状态查看和下载页面 |
 | [vendor](vendor) | 随插件发布的 SemIf 与 Laya 源码、许可和来源记录 |
 | [bridge.py](bridge.py) | AstrBot 运行时接入、实际模型输入覆盖、群消息发送观察 |
 | [reply.py](reply.py) | 不重放入站消息的独立回复任务及资源清理 |

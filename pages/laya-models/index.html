@@ -3,28 +3,36 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>模型管理与测试</title>
+    <title>模型实验场</title>
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
     <main class="page">
       <header>
-        <h1>模型管理与测试</h1>
-        <p class="subtitle">下载本地模型，或用 Laya、SemIf、Jev 测试自己的判断场景。</p>
+        <h1>模型实验场</h1>
+        <p class="subtitle">选择模型并测试 Choice、Score、Noul 或群聊唤醒；本地模型可直接下载。</p>
       </header>
-      <nav class="backend-switch" aria-label="模型后端">
-        <button type="button" data-backend="laya" aria-pressed="true">Laya</button>
-        <button type="button" data-backend="semif" aria-pressed="false">SemIf</button>
-        <button type="button" data-backend="jev" aria-pressed="false">Jev</button>
-      </nav>
       <div id="notice" class="notice" hidden></div>
-      <section id="models" class="models" aria-live="polite"></section>
+      <section class="model-management" aria-labelledby="models-title">
+        <div class="section-heading">
+          <div>
+            <h2 id="models-title">可用模型</h2>
+            <p class="hint">这里是测试模型列表；本地模型未下载时，可直接在对应行下载。</p>
+          </div>
+        </div>
+        <div id="models" class="models" aria-live="polite"></div>
+      </section>
       <section class="playground" aria-labelledby="test-title">
         <div class="heading">
           <div>
             <h2 id="test-title">模型测试</h2>
             <p class="hint">临时选择任意模型测试，结果仅用于观察判断效果。首次测试需要加载模型。</p>
           </div>
+          <nav class="backend-switch" aria-label="测试后端">
+            <button type="button" data-backend="laya" aria-pressed="true">Laya</button>
+            <button type="button" data-backend="semif" aria-pressed="false">SemIf</button>
+            <button type="button" data-backend="jev" aria-pressed="false">Jev</button>
+          </nav>
         </div>
         <form id="test-form">
           <fieldset id="test-fields">
@@ -32,12 +40,15 @@
               <label>测试类型
                 <select id="test-mode">
                   <option value="wake">群聊唤醒</option>
-                  <option value="choice">通用判断</option>
+                  <option value="choice">Choice · 选择</option>
+                  <option value="score">Score · 评分</option>
+                  <option value="noul">Noul · 二值概率</option>
                 </select>
+                <span id="test-mode-hint" class="hint">使用历史消息和待判断消息，复现群聊唤醒场景。</span>
               </label>
               <label id="local-model-field">测试模型
                 <select id="test-model" aria-describedby="model-hint"></select>
-                <span id="model-hint" class="hint">本地模型需要先下载；选择模型后可直接测试。</span>
+                <span id="model-hint" class="hint">本地模型需要先下载；选择测试模型后点击“开始测试”。</span>
               </label>
               <label id="jev-model-field" hidden>Jev 模型版本
                 <input id="test-jev-model" type="text" value="jev-1.13.0" required pattern="jev-[0-9]+\.[0-9]+\.[0-9]+" />
@@ -71,18 +82,18 @@
               </label>
             </div>
             <div id="choice-fields" hidden>
-              <label>背景 / 待判断内容
+              <label>背景 / 输入内容
                 <textarea id="test-context" rows="5">我的订单已经付款三天了，物流信息一直没有更新，请帮我查询一下。</textarea>
               </label>
               <label class="checkbox-label"><input id="context-json" type="checkbox" /> 将背景作为 JSON 对象或数组输入</label>
               <label>判断问题
                 <textarea id="test-question" rows="2" maxlength="2000">这条客户消息应该交给哪个团队处理？</textarea>
               </label>
-              <label>候选选项（每行一项，2～16 项）
+              <label id="options-field"><span id="options-label">候选选项（每行一项，2～16 项）</span>
                 <textarea id="test-options" rows="4">物流团队：处理配送进度、运输异常和物流查询
 售后团队：处理退货、退款和质量问题
 销售团队：处理商品咨询和购买建议</textarea>
-                <span class="hint">填写“是”和“否”即可测试二选一判断；也可写更具体的选项描述。</span>
+                <span id="options-hint" class="hint">Choice 会显示胜出选项；Score 会保留每个选项的概率。</span>
               </label>
             </div>
             <div class="actions">

@@ -34,7 +34,7 @@ def make_preset(directory: Path, spec):
     (directory / "model-00001.safetensors").write_bytes(b"weights")
 
 
-async def test_astrbot_discovers_semif_model_page():
+async def test_astrbot_discovers_merged_model_page():
     plugin_root = Path(__file__).resolve().parents[1]
     plugin = SimpleNamespace(
         name=plugin_root.name, root_dir_name=plugin_root.name, reserved=False
@@ -45,7 +45,8 @@ async def test_astrbot_discovers_semif_model_page():
     )
     service = PluginPageService(manager)
     pages = await service.serialize_plugin_pages(plugin)
-    assert {page["name"] for page in pages} >= {"laya-models", "semif-models"}
+    assert {page["name"] for page in pages} >= {"laya-models"}
+    assert "semif-models" not in {page["name"] for page in pages}
     assert pages[0]["name"] == "laya-models"
     sidebar_page = (plugin_root / "pages" / pages[0]["name"] / "index.html").read_text(
         encoding="utf-8"
@@ -55,8 +56,8 @@ async def test_astrbot_discovers_semif_model_page():
     assert 'data-backend="jev"' in sidebar_page
     assert 'id="test-form"' in sidebar_page
     titles = PluginManager._load_plugin_i18n(str(plugin_root))["zh-CN"]["pages"]
-    assert titles["laya-models"]["title"] == "模型管理与测试"
-    assert titles["semif-models"]["title"] == "SemIf 模型"
+    assert titles["laya-models"]["title"] == "模型实验场"
+    assert "semif-models" not in titles
 
 
 def test_semif_preset_and_custom_model_selection(tmp_path, monkeypatch):

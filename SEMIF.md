@@ -6,7 +6,7 @@ SemIf 是可选的本地语义判断后端。SemIf Python 源码已包含在插�
 
 ## 配置
 
-在 AstrBot 的 Python 环境中安装 PyTorch、Transformers 等模型依赖，无需另外安装 `semif-phase1`。在插件配置的「语义唤醒」中选择 **SemIf 本地**，并选择预设模型或自定义模型，无需配置 Python 路径。从 AstrBot WebUI 侧边栏进入 **模型管理与测试**，切换到 **SemIf**，即可选择、下载预设模型；插件详情中的 **SemIf 模型** 独立页面也可使用。下载同样使用 AstrBot 的 Python 环境。下载完成可直接在统一页面测试群聊唤醒或自定义选项，见 [页面测试](README.md#-页面测试)；用于群聊的模型选择需重载插件后生效。下载目录为 `data/plugin_data/astrbot_plugin_qq_group_enhance/models/semif/<模型名>/`。
+在 AstrBot 的 Python 环境中安装 PyTorch、Transformers 等模型依赖，无需另外安装 `semif-phase1`。在插件配置的「语义唤醒」中选择 **SemIf 本地**，并选择预设模型或自定义模型，无需配置 Python 路径。从 AstrBot WebUI 侧边栏进入 **模型实验场**，在 **SemIf** 分组即可下载预设模型并选择用于测试。下载同样使用 AstrBot 的 Python 环境。下载完成可直接在统一页面测试群聊唤醒、Choice、Score 或 Noul，见 [页面测试](README.md#-页面测试)；测试页面的模型选择不会修改群聊后端配置。下载目录为 `data/plugin_data/astrbot_plugin_qq_group_enhance/models/semif/<模型名>/`。
 
 | 预设 | Hugging Face 模型 | 说明 |
 | --- | --- | --- |

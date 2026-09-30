@@ -14,7 +14,7 @@ Laya 模型选择     multilingual（默认）
 计算设备          cuda
 ```
 
-AstrBot 的 Python 环境须安装 PyTorch、Transformers、safetensors、huggingface_hub、NumPy 等模型依赖，无需另外安装 `laya`。worker 始终从插件自带目录读取 Laya 源码。支持 `english`（`convaiinnovations/laya`）、`multilingual`（`convaiinnovations/laya-multilingual`）和 `typed-decisions`（`convaiinnovations/laya-typed-decisions`）。从 AstrBot WebUI 侧边栏进入 **模型管理与测试**，切换到 **Laya**，即可选择模型并下载；下载同样使用 AstrBot 的 Python 环境，权重只保存到 `plugin_data/astrbot_plugin_qq_group_enhance/models/`，不会写入插件源码目录。指定的设备不可用时，启动或推理会报错并暂停语义判断。下载后可直接测试群聊唤醒或自定义选项，使用方式见 [页面测试](README.md#-页面测试)。
+AstrBot 的 Python 环境须安装 PyTorch、Transformers、safetensors、huggingface_hub、NumPy 等模型依赖，无需另外安装 `laya`。worker 始终从插件自带目录读取 Laya 源码。支持 `english`（`convaiinnovations/laya`）、`multilingual`（`convaiinnovations/laya-multilingual`）和 `typed-decisions`（`convaiinnovations/laya-typed-decisions`）。从 AstrBot WebUI 侧边栏进入 **模型实验场**，在 **Laya** 分组即可下载模型并选择测试；下载同样使用 AstrBot 的 Python 环境，权重只保存到 `plugin_data/astrbot_plugin_qq_group_enhance/models/`，不会写入插件源码目录。指定的设备不可用时，启动或推理会报错并暂停语义判断。下载后可直接测试群聊唤醒或自定义选项，使用方式见 [页面测试](README.md#-页面测试)。
 
 旧的 `semif_python` 和 `laya_python` 配置已移除，直接传入会报错；请删除这些字段，并将模型依赖安装到 AstrBot 的 Python 环境。
 

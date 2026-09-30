@@ -120,6 +120,58 @@ async def test_jev_native_choice_contract_and_model_override(monkeypatch):
         await tester.close()
 
 
+async def test_jev_native_noul_contract(monkeypatch):
+    send = AsyncMock(
+        return_value={
+            "answers": {"q0": {"type": "noul", "noul": 0.82}},
+            "usage": {"input_tokens": 8},
+        }
+    )
+    monkeypatch.setattr(model_test.JevClient, "_send", send)
+    tester = ModelTester()
+    try:
+        result = await tester.run(
+            {"semantic": {"jev_api_key": "secret"}},
+            choice_payload(mode="noul"),
+        )
+        request = send.call_args.args[0]
+        assert request["questions"]["q0"] == {
+            "type": "noul",
+            "instructions": (
+                "判断以下陈述是否成立，只在‘是’与‘否’中选择：\n"
+                "应该交给哪个团队？"
+            ),
+        }
+        assert result["results"] == [{"id": "q0", "probability": 0.82}]
+        assert result["scores"][0]["probabilities"] == [0.82, 0.18]
+    finally:
+        await tester.close()
+
+
+@pytest.mark.parametrize("backend", ["laya", "semif"])
+async def test_local_score_mode_returns_probabilities_without_winner(
+    monkeypatch, backend
+):
+    mock_local(monkeypatch, backend)
+    tester = ModelTester()
+    payload = choice_payload(
+        backend,
+        mode="score",
+        model="multilingual" if backend == "laya" else SEMIF_MODELS[0].key,
+    )
+    try:
+        result = await tester.run({}, payload)
+        assert result["results"][0].keys() == {"id", "options"}
+        assert "selected" not in result["results"][0]
+        assert [item["probability"] for item in result["results"][0]["options"]] == [
+            0.1,
+            0.7,
+            0.2,
+        ]
+    finally:
+        await tester.close()
+
+
 @pytest.mark.parametrize("backend", ["jev", "laya", "semif"])
 async def test_wake_test_uses_real_rules_and_temporary_threshold(monkeypatch, backend):
     mock_local(monkeypatch, backend)

@@ -20,6 +20,7 @@ let settings = null;
 let modelSignature = "";
 let refreshVersion = 0;
 let testing = false;
+let modelData = {};
 
 function showNotice(message, error = false) {
   noticeElement.hidden = !message;
@@ -64,77 +65,84 @@ function fillModelSelect(backend, data) {
   testModel.value = selected?.key || "";
 }
 
-function render(backend, data) {
-  modelsElement.replaceChildren();
-  if (backend === "jev") {
-    const card = addText(modelsElement, "article", "", "model-card");
-    addText(card, "h2", "Jev 云端模型");
-    addText(card, "p", `当前配置：${settings.jev.model}。${settings.jev.configured ? "已配置 API Key，可以直接测试。" : "请在插件配置中填写 API Key 并重载插件。"}`);
-    addText(card, "p", "云端模型无需下载。每次测试会调用配置的 Jev 接口，费用按服务商规则计算。");
-    return;
-  }
-  if (backend === "semif") {
-    const custom = addText(modelsElement, "article", "", `model-card ${data.selected === "custom" ? "selected" : ""}`);
-    addText(custom, "h2", "自定义模型");
-    addText(custom, "p", "使用插件配置中的 SemIf 模型目录或 Hugging Face ID，以及固定模型版本。");
-    const actions = addText(custom, "div", "", "actions");
-    addButton(actions, data.selected === "custom" ? "已保存模型" : "选择模型", () => selectModel(backend, "custom"), data.selected === "custom");
-    addButton(actions, "测试模型", () => chooseTestModel("custom"), testing, "secondary");
-  }
-  for (const model of data.models || []) {
-    const card = addText(modelsElement, "article", "", `model-card ${model.selected ? "selected" : ""}`);
-    const heading = addText(card, "div", "", "heading");
-    const name = addText(heading, "div", "");
-    addText(name, "h2", model.label);
-    addText(name, "code", model.repo_id || model.key);
-    const stateText = { ready: "已下载", downloading: "下载中…", error: "下载失败", idle: "未下载" }[model.state] || model.state;
-    addText(heading, "span", stateText, `state ${model.state}`);
-    addText(card, "p", model.description);
-    if (model.error) addText(card, "p", model.error, "error-text");
-    const actions = addText(card, "div", "", "actions");
-    addButton(actions, model.selected ? "已保存模型" : "选择模型", () => selectModel(backend, model.key), model.selected);
-    addButton(actions, model.state === "downloading" ? "下载中…" : "下载", () => downloadModel(backend, model.key), ["downloading", "ready"].includes(model.state), "secondary");
-    addButton(actions, "测试模型", () => chooseTestModel(model.key), model.state !== "ready" || testing, "secondary");
-  }
-  fillModelSelect(backend, data);
+function stateText(state) {
+  return { ready: "已下载", downloading: "下载中…", error: "下载失败", idle: "未下载" }[state] || state;
 }
 
-function chooseTestModel(key) {
+function renderModel(parent, backend, model) {
+  const card = addText(parent, "article", "", "model-card");
+  const heading = addText(card, "div", "", "heading");
+  const name = addText(heading, "div", "", "model-name");
+  addText(name, "strong", model.label);
+  addText(name, "code", model.repo_id || model.key);
+  addText(heading, "span", stateText(model.state), `state ${model.state}`);
+  if (model.error) addText(card, "p", model.error, "error-text");
+  const actions = addText(card, "div", "", "actions");
+  addButton(actions, model.state === "downloading" ? "下载中…" : "下载", () => downloadModel(backend, model.key), ["downloading", "ready"].includes(model.state), "secondary");
+  addButton(actions, "选择测试", () => chooseTestModel(backend, model.key), model.state !== "ready" || testing);
+}
+
+function renderModels() {
+  modelsElement.replaceChildren();
+  const layaGroup = addText(modelsElement, "section", "", "model-group");
+  addText(layaGroup, "h3", "Laya");
+  addText(layaGroup, "p", "本地语义唤醒模型", "group-hint");
+  for (const model of modelData.laya?.models || []) renderModel(layaGroup, "laya", model);
+
+  const semifGroup = addText(modelsElement, "section", "", "model-group");
+  addText(semifGroup, "h3", "SemIf");
+  addText(semifGroup, "p", "可下载预设或使用插件配置中的自定义模型", "group-hint");
+  const semif = modelData.semif;
+  if (semif) {
+    const custom = addText(semifGroup, "article", "", "model-card");
+    const heading = addText(custom, "div", "", "heading");
+    addText(heading, "strong", "自定义模型");
+    addText(heading, "span", "可测试", "state ready");
+    const actions = addText(custom, "div", "", "actions");
+    addButton(actions, "选择测试", () => chooseTestModel("semif", "custom"), testing);
+    for (const model of semif.models || []) renderModel(semifGroup, "semif", model);
+  }
+
+  const jevGroup = addText(modelsElement, "section", "", "model-group");
+  addText(jevGroup, "h3", "Jev");
+  addText(jevGroup, "p", `云端模型：${settings.jev.model}。${settings.jev.configured ? "已配置 API Key，可以直接测试。" : "请在插件配置中填写 API Key 并重载插件。"}`, "group-hint");
+  const jevCard = addText(jevGroup, "article", "", "model-card compact-card");
+  addText(jevCard, "span", "无需下载", "state ready");
+  addButton(addText(jevCard, "div", "", "actions"), "选择测试", () => chooseTestModel("jev", settings.jev.model), testing);
+
+  const data = modelData[currentBackend];
+  if (currentBackend !== "jev" && data) fillModelSelect(currentBackend, data);
+}
+
+function chooseTestModel(backend, key) {
   if (testing) return;
-  testModel.value = key;
+  if (currentBackend !== backend) switchBackend(backend);
+  if (backend === "jev") document.getElementById("test-jev-model").value = key;
+  else testModel.value = key;
+  testStatus.textContent = `${backends[backend].label} · ${key} 已选为本次测试模型。`;
   document.querySelector(".playground").scrollIntoView({ behavior: "smooth", block: "start" });
-  testModel.focus({ preventScroll: true });
+  (backend === "jev" ? document.getElementById("test-jev-model") : testModel).focus({ preventScroll: true });
 }
 
 async function refresh() {
-  const backend = currentBackend;
   const version = ++refreshVersion;
-  if (backend === "jev") {
-    render(backend);
-    return;
-  }
   try {
-    const data = await bridge.apiGet(backends[backend].endpoint);
-    if (backend === currentBackend && version === refreshVersion) render(backend, data);
+    const [laya, semif] = await Promise.all([
+      bridge.apiGet(backends.laya.endpoint),
+      bridge.apiGet(backends.semif.endpoint),
+    ]);
+    if (version !== refreshVersion) return;
+    modelData = { laya, semif };
+    renderModels();
   } catch (error) {
-    if (backend === currentBackend && version === refreshVersion) showNotice(error.message || "读取模型状态失败", true);
-  }
-}
-
-async function selectModel(backend, key) {
-  try {
-    await bridge.apiPost(`${backends[backend].endpoint}/select`, { model: key });
-    showNotice(`${backends[backend].label} 模型选择已保存，重载插件后用于群聊；页面测试可直接使用。`);
-    await refresh();
-  } catch (error) {
-    showNotice(error.message || "保存模型选择失败", true);
+    if (version === refreshVersion) showNotice(error.message || "读取模型状态失败", true);
   }
 }
 
 async function downloadModel(backend, key) {
   try {
     await bridge.apiPost(`${backends[backend].endpoint}/download`, { model: key });
-    showNotice("已开始下载，页面会自动刷新状态。下载完成后可直接测试，群聊使用需要重载插件。");
+    showNotice("已开始下载，页面会自动刷新状态。下载完成后可在本页选择测试，不会修改插件配置。");
     await refresh();
   } catch (error) {
     showNotice(error.message || "开始下载失败", true);
@@ -156,16 +164,30 @@ async function switchBackend(backend) {
   testError.hidden = true;
   testStatus.textContent = "";
   testResults.replaceChildren();
-  modelsElement.replaceChildren();
-  await refresh();
+  const data = modelData[backend];
+  if (backend !== "jev" && data) fillModelSelect(backend, data);
 }
 
 function switchMode() {
-  const wake = testMode.value === "wake";
+  const mode = testMode.value;
+  const wake = mode === "wake";
+  const noul = mode === "noul";
   document.getElementById("wake-fields").hidden = !wake;
   document.getElementById("choice-fields").hidden = wake;
   for (const input of document.querySelectorAll("#wake-fields input, #wake-fields textarea")) input.disabled = !wake;
-  for (const input of document.querySelectorAll("#choice-fields input, #choice-fields textarea")) input.disabled = wake;
+  for (const input of document.querySelectorAll("#choice-fields input, #choice-fields textarea")) {
+    input.disabled = wake || (noul && input.id === "test-options");
+  }
+  document.getElementById("options-field").hidden = wake || noul;
+  const copy = {
+    wake: ["使用历史消息和待判断消息，复现群聊唤醒场景。", "候选选项", "唤醒场景会自动生成正反两道评分题。"],
+    choice: ["从多个选项中选择概率最高的一项。", "候选选项（每行一项，2～16 项）", "会显示每个选项的概率，并标记最高概率选项。"],
+    score: ["对每个选项分别评分，只观察概率，不强制选出赢家。", "评分项（每行一项，2～16 项）", "会保留每个选项的概率，适合比较多个候选。"],
+    noul: ["判断一个命题成立的概率；本地模型使用是/否评分，Jev 使用原生 noul。", "候选选项", "Noul 不需要填写选项。"],
+  }[mode];
+  document.getElementById("test-mode-hint").textContent = copy[0];
+  document.getElementById("options-label").textContent = copy[1];
+  document.getElementById("options-hint").textContent = copy[2];
   testError.hidden = true;
   testResults.replaceChildren();
   testStatus.textContent = "";
@@ -203,6 +225,12 @@ function renderResults(data) {
       addText(heading, "span", result.passed ? "达到唤醒阈值" : "未达到唤醒阈值", `state ${result.passed ? "ready" : "idle"}`);
       addText(card, "p", result.text);
       probabilityRow(card, "对机器人说话的概率", result.probability);
+    } else if (data.mode === "noul") {
+      addText(card, "strong", "Noul 概率");
+      probabilityRow(card, "命题成立概率", result.probability);
+    } else if (data.mode === "score") {
+      addText(card, "strong", "Score 结果");
+      for (const option of result.options) probabilityRow(card, `${option.id} · ${option.label}`, option.probability);
     } else {
       const selected = result.options.find((option) => option.id === result.selected);
       addText(card, "strong", `判定结果：${selected.id}`);
@@ -234,7 +262,9 @@ testForm.addEventListener("submit", async (event) => {
       payload.context = document.getElementById("context-json").checked
         ? jsonInput("test-context", "背景") : document.getElementById("test-context").value;
       payload.question = document.getElementById("test-question").value;
-      payload.options = document.getElementById("test-options").value.split("\n").map((option) => option.trim()).filter(Boolean);
+      if (payload.mode !== "noul") {
+        payload.options = document.getElementById("test-options").value.split("\n").map((option) => option.trim()).filter(Boolean);
+      }
     }
     testing = true;
     testFields.disabled = true;
@@ -256,7 +286,9 @@ testForm.addEventListener("submit", async (event) => {
 });
 
 document.getElementById("test-example").addEventListener("click", () => {
-  const ids = testMode.value === "wake" ? ["test-history", "test-candidates"] : ["test-context", "test-question", "test-options"];
+  const ids = testMode.value === "wake"
+    ? ["test-history", "test-candidates"]
+    : ["test-context", "test-question", ...(testMode.value === "noul" ? [] : ["test-options"])];
   for (const id of ids) {
     const input = document.getElementById(id);
     input.value = input.defaultValue;
@@ -276,8 +308,9 @@ try {
   switchMode();
   await switchBackend(settings.backend);
   setInterval(() => {
-    if (currentBackend !== "jev" && !testing && !document.hidden) refresh();
+    if (!testing && !document.hidden) refresh();
   }, 3000);
+  await refresh();
 } catch (error) {
   showNotice(error.message || "初始化模型页面失败", true);
   testFields.disabled = true;

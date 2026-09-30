@@ -1,4 +1,4 @@
-"""Isolated, reusable model playground for wake and arbitrary choice questions."""
+"""Isolated, reusable model playground for wake, choice, score, and Noul tests."""
 
 from __future__ import annotations
 
@@ -128,8 +128,8 @@ class ModelTester:
         if backend not in ("jev", "laya", "semif"):
             raise ValueError("backend 只能是 jev、laya 或 semif")
         mode = payload.get("mode")
-        if mode not in ("wake", "choice"):
-            raise ValueError("mode 只能是 wake 或 choice")
+        if mode not in ("wake", "choice", "score", "noul"):
+            raise ValueError("mode 只能是 wake、choice、score 或 noul")
         config = deepcopy(dict(config))
         semantic = config.setdefault("semantic", {})
         if not isinstance(semantic, dict):
@@ -188,16 +188,22 @@ class ModelTester:
         ):
             raise ValueError("context 必须是非空背景文本、JSON 对象或数组")
         question = text(payload.get("question"), "question", 2000)
-        options = payload.get("options")
-        if not isinstance(options, list) or not 2 <= len(options) <= 16:
-            raise ValueError("options 必须包含 2～16 个选项")
-        options = [text(option, "选项", 500) for option in options]
-        if len(set(options)) != len(options):
-            raise ValueError("选项内容不能重复")
+        if mode == "noul":
+            options = ["是", "否"]
+        else:
+            options = payload.get("options")
+            if not isinstance(options, list) or not 2 <= len(options) <= 16:
+                raise ValueError("options 必须包含 2～16 个选项")
+            options = [text(option, "选项", 500) for option in options]
+            if len(set(options)) != len(options):
+                raise ValueError("选项内容不能重复")
+        row_question = question
+        if mode == "noul":
+            row_question = "判断以下陈述是否成立，只在‘是’与‘否’中选择：\n" + question
         rows = [
             {
                 "id": "q0",
-                "question": question,
+                "question": row_question,
                 "options": [
                     {"id": letter, "description": option}
                     for letter, option in zip(LETTERS, options)
@@ -241,8 +247,14 @@ class ModelTester:
                         results = self._wake_results(
                             settings, plan["candidates"], probabilities
                         )
-                    else:
+                    elif plan["mode"] == "noul":
+                        results = self._noul_results(scores[0]["probabilities"][0])
+                    elif plan["mode"] == "choice":
                         results = self._choice_results(
+                            plan["rows"][0], scores[0]["probabilities"]
+                        )
+                    else:
+                        results = self._score_results(
                             plan["rows"][0], scores[0]["probabilities"]
                         )
                 model = {
@@ -303,6 +315,28 @@ class ModelTester:
             }
         ]
 
+    @staticmethod
+    def _score_results(row, probabilities):
+        return [
+            {
+                "id": row["id"],
+                "options": [
+                    {
+                        "id": option["id"],
+                        "label": option["description"],
+                        "probability": probability,
+                    }
+                    for option, probability in zip(
+                        row["options"], probabilities, strict=True
+                    )
+                ],
+            }
+        ]
+
+    @staticmethod
+    def _noul_results(probability):
+        return [{"id": "q0", "probability": probability}]
+
     async def _jev(self, settings, plan):
         if plan["mode"] == "wake":
             probabilities = await self.client.judge(
@@ -310,17 +344,21 @@ class ModelTester:
             )
             return self._wake_results(settings, plan["candidates"], probabilities), {}
         row = plan["rows"][0]
+        question = {
+            "type": "noul"
+            if plan["mode"] == "noul"
+            else "choice",
+            "instructions": row["question"],
+        }
+        if plan["mode"] != "noul":
+            question["criteria"] = {
+                option["id"]: option["description"] for option in row["options"]
+            }
         payload = {
             "model": settings.jev_model,
             "state": plan["state"],
             "questions": {
-                row["id"]: {
-                    "type": "choice",
-                    "instructions": row["question"],
-                    "criteria": {
-                        option["id"]: option["description"] for option in row["options"]
-                    },
-                }
+                row["id"]: question
             },
         }
         state_size = json_bytes(payload["state"]) + json_bytes(
@@ -337,21 +375,45 @@ class ModelTester:
             raise RuntimeError("Jev 返回的题目 ID 不匹配")
         answer = answers[row["id"]]
         ids = [option["id"] for option in row["options"]]
-        if (
-            not isinstance(answer, dict)
-            or answer.get("type") != "choice"
-            or answer.get("choice") not in ids
-            or not isinstance(answer.get("probabilities"), dict)
-            or set(answer["probabilities"]) != set(ids)
-        ):
-            raise RuntimeError("Jev 返回了无效的 choice 结果")
-        probabilities = [answer["probabilities"][option_id] for option_id in ids]
-        scores = [{"id": row["id"], "option_ids": ids, "probabilities": probabilities}]
-        validate_scores([row], scores)
-        if answer["probabilities"][answer["choice"]] != max(probabilities):
-            raise RuntimeError("Jev 返回的 choice 与最高概率不匹配")
+        if plan["mode"] == "noul":
+            probability = answer.get("noul") if isinstance(answer, dict) else None
+            if (
+                not isinstance(answer, dict)
+                or answer.get("type") != "noul"
+                or type(probability) not in (int, float)
+                or not math.isfinite(probability)
+                or not 0 <= probability <= 1
+            ):
+                raise RuntimeError("Jev 返回了无效的 noul 结果")
+            probabilities = [probability, 1 - probability]
+            scores = [
+                {"id": row["id"], "option_ids": ids, "probabilities": probabilities}
+            ]
+            validate_scores([row], scores)
+            results = self._noul_results(probability)
+        else:
+            if (
+                not isinstance(answer, dict)
+                or answer.get("type") != "choice"
+                or answer.get("choice") not in ids
+                or not isinstance(answer.get("probabilities"), dict)
+                or set(answer["probabilities"]) != set(ids)
+            ):
+                raise RuntimeError("Jev 返回了无效的 choice 结果")
+            probabilities = [answer["probabilities"][option_id] for option_id in ids]
+            scores = [
+                {"id": row["id"], "option_ids": ids, "probabilities": probabilities}
+            ]
+            validate_scores([row], scores)
+            if answer["probabilities"][answer["choice"]] != max(probabilities):
+                raise RuntimeError("Jev 返回的 choice 与最高概率不匹配")
+            results = (
+                self._choice_results(row, probabilities)
+                if plan["mode"] == "choice"
+                else self._score_results(row, probabilities)
+            )
         usage = response.get("usage")
-        return self._choice_results(row, probabilities), {
+        return results, {
             "scores": scores,
             "usage": usage if isinstance(usage, dict) else {},
         }
